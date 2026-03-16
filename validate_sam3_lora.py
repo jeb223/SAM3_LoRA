@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+from collections import defaultdict
 from pathlib import Path
 import numpy as np
 from PIL import Image as PILImage
@@ -370,7 +371,7 @@ def apply_sam3_nms(pred_logits, pred_masks, pred_boxes, prob_threshold=0.3, nms_
 
 
 def convert_predictions_to_coco_format(predictions_list, image_ids, resolution=288,
-                                       prob_threshold=0.3, nms_iou_threshold=0.7, max_detections=100,
+                                       prob_threshold=0.4, nms_iou_threshold=0.7, max_detections=30,
                                        merge_cracks=False, merge_iou_threshold=0.15,
                                        verbose=True, category_ids=None):
     """
@@ -594,6 +595,128 @@ def create_coco_gt_from_dataset(dataset, image_ids=None, mask_resolution=288):
     print(f"[INFO] Created {len(coco_gt['images'])} images, {len(coco_gt['annotations'])} annotations")
 
     return coco_gt
+
+
+def compute_multiclass_semantic_metrics(coco_gt_dict, coco_predictions):
+    """
+    Compute semantic segmentation metrics from instance-style COCO masks.
+
+    We collapse instances into a per-pixel semantic label map:
+    - GT: later annotations overwrite earlier ones if overlaps exist.
+    - Pred: the category of the highest-score mask wins for each pixel.
+
+    Returns:
+        Dict with multi-class semantic mIoU and pixel-level F1 summaries.
+    """
+    categories = coco_gt_dict.get("categories", [])
+    sorted_cat_ids = sorted(int(cat["id"]) for cat in categories)
+    if not sorted_cat_ids:
+        return {
+            "semantic_mIoU": 0.0,
+            "semantic_macro_F1": 0.0,
+            "semantic_micro_F1": 0.0,
+            "semantic_pixel_accuracy": 0.0,
+            "semantic_num_classes": 0,
+        }
+
+    cat_id_to_index = {cat_id: idx + 1 for idx, cat_id in enumerate(sorted_cat_ids)}
+    num_labels = len(sorted_cat_ids) + 1  # background = 0
+
+    images_by_id = {int(img["id"]): img for img in coco_gt_dict.get("images", [])}
+
+    gt_by_image = defaultdict(list)
+    for ann in coco_gt_dict.get("annotations", []):
+        gt_by_image[int(ann["image_id"])].append(ann)
+
+    pred_by_image = defaultdict(list)
+    for ann in coco_predictions:
+        pred_by_image[int(ann["image_id"])].append(ann)
+
+    confusion = np.zeros((num_labels, num_labels), dtype=np.int64)
+
+    for image_id, image_info in images_by_id.items():
+        height = int(image_info["height"])
+        width = int(image_info["width"])
+
+        gt_semantic = np.zeros((height, width), dtype=np.int32)
+        for ann in gt_by_image.get(image_id, []):
+            cat_id = int(ann["category_id"])
+            if cat_id not in cat_id_to_index:
+                continue
+            if "segmentation" not in ann:
+                continue
+            mask = mask_utils.decode(ann["segmentation"])
+            if mask.ndim == 3:
+                mask = mask[..., 0]
+            gt_semantic[mask.astype(bool)] = cat_id_to_index[cat_id]
+
+        pred_semantic = np.zeros((height, width), dtype=np.int32)
+        pred_score_map = np.zeros((height, width), dtype=np.float32)
+        for ann in pred_by_image.get(image_id, []):
+            cat_id = int(ann["category_id"])
+            if cat_id not in cat_id_to_index:
+                continue
+            if "segmentation" not in ann:
+                continue
+            mask = mask_utils.decode(ann["segmentation"])
+            if mask.ndim == 3:
+                mask = mask[..., 0]
+            mask = mask.astype(bool)
+            if not np.any(mask):
+                continue
+            score = float(ann.get("score", 0.0))
+            overwrite = mask & (score >= pred_score_map)
+            pred_semantic[overwrite] = cat_id_to_index[cat_id]
+            pred_score_map[overwrite] = score
+
+        combined = num_labels * gt_semantic.reshape(-1) + pred_semantic.reshape(-1)
+        confusion += np.bincount(
+            combined,
+            minlength=num_labels * num_labels,
+        ).reshape(num_labels, num_labels)
+
+    tp = np.diag(confusion).astype(np.float64)
+    gt_pixels = confusion.sum(axis=1).astype(np.float64)
+    pred_pixels = confusion.sum(axis=0).astype(np.float64)
+
+    fg_tp = tp[1:]
+    fg_gt = gt_pixels[1:]
+    fg_pred = pred_pixels[1:]
+
+    class_union = fg_gt + fg_pred - fg_tp
+    class_iou = np.divide(
+        fg_tp,
+        class_union,
+        out=np.zeros_like(fg_tp),
+        where=class_union > 0,
+    )
+    class_f1 = np.divide(
+        2.0 * fg_tp,
+        fg_gt + fg_pred,
+        out=np.zeros_like(fg_tp),
+        where=(fg_gt + fg_pred) > 0,
+    )
+
+    valid_iou = class_union > 0
+    valid_f1 = (fg_gt + fg_pred) > 0
+
+    total_fg_tp = float(fg_tp.sum())
+    total_fg_fp = float((fg_pred - fg_tp).sum())
+    total_fg_fn = float((fg_gt - fg_tp).sum())
+    semantic_micro_f1 = (
+        (2.0 * total_fg_tp) / (2.0 * total_fg_tp + total_fg_fp + total_fg_fn + 1e-6)
+    )
+
+    total_pixels = float(confusion.sum())
+    semantic_pixel_accuracy = float(tp.sum()) / (total_pixels + 1e-6)
+
+    return {
+        "semantic_mIoU": float(class_iou[valid_iou].mean()) if np.any(valid_iou) else 0.0,
+        "semantic_macro_F1": float(class_f1[valid_f1].mean()) if np.any(valid_f1) else 0.0,
+        "semantic_micro_F1": float(semantic_micro_f1),
+        "semantic_pixel_accuracy": float(semantic_pixel_accuracy),
+        "semantic_num_classes": len(sorted_cat_ids),
+    }
 
 
 def convert_predictions_to_coco_format_original_res(predictions_list, image_ids, dataset, model_resolution=288, score_threshold=0.0, merge_overlaps=True, iou_threshold=0.3, debug=False, category_ids=None):
@@ -1028,6 +1151,32 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
     print("RUNNING VALIDATION")
     print("="*80)
 
+    metrics_result = {
+        "use_base_model": bool(use_base_model),
+        "config_path": config_path,
+        "weights_path": weights_path,
+        "val_data_dir": val_data_dir,
+        "num_samples": num_samples,
+        "prob_threshold": float(prob_threshold),
+        "nms_iou": float(nms_iou),
+        "merge_cracks": bool(merge_cracks),
+        "merge_iou": float(merge_iou),
+        "num_query_items": 0,
+        "num_unique_images": 0,
+        "num_unique_categories": 0,
+        "num_predictions": 0,
+        "mAP": None,
+        "mAP50": None,
+        "mAP75": None,
+        "cgF1": None,
+        "cgF1_50": None,
+        "cgF1_75": None,
+        "semantic_mIoU": None,
+        "semantic_macro_F1": None,
+        "semantic_micro_F1": None,
+        "semantic_pixel_accuracy": None,
+    }
+
     all_image_ids = []
     all_category_ids = []
     coco_predictions = []
@@ -1126,6 +1275,9 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         f"\nCollected predictions for {len(all_image_ids)} query-items "
         f"across {len(unique_image_ids)} unique images and {len(unique_category_ids)} categories"
     )
+    metrics_result["num_query_items"] = len(all_image_ids)
+    metrics_result["num_unique_images"] = len(unique_image_ids)
+    metrics_result["num_unique_categories"] = len(unique_category_ids)
 
     # Compute metrics
     print("\n" + "="*80)
@@ -1154,6 +1306,7 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         print(f"\n[INFO] Total predictions after CRACK MERGING: {len(coco_predictions)}")
     else:
         print(f"\n[INFO] Total predictions after SAM3 NMS filtering: {len(coco_predictions)}")
+    metrics_result["num_predictions"] = len(coco_predictions)
 
     if len(coco_predictions) > 0:
         # Save temporary files for COCO evaluation
@@ -1190,6 +1343,9 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         map_segm = coco_eval.stats[0]
         map50_segm = coco_eval.stats[1]
         map75_segm = coco_eval.stats[2]
+        metrics_result["mAP"] = float(map_segm)
+        metrics_result["mAP50"] = float(map50_segm)
+        metrics_result["mAP75"] = float(map75_segm)
 
         # Compute cgF1
         print("\n" + "="*80)
@@ -1207,6 +1363,33 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         cgf1 = cgf1_results.get('cgF1_eval_segm_cgF1', 0.0)
         cgf1_50 = cgf1_results.get('cgF1_eval_segm_cgF1@0.5', 0.0)
         cgf1_75 = cgf1_results.get('cgF1_eval_segm_cgF1@0.75', 0.0)
+        metrics_result["cgF1"] = float(cgf1)
+        metrics_result["cgF1_50"] = float(cgf1_50)
+        metrics_result["cgF1_75"] = float(cgf1_75)
+
+        # Compute semantic segmentation metrics from the same masks
+        print("\n" + "="*80)
+        print("SEMANTIC mIoU / F1 EVALUATION")
+        print("="*80)
+        semantic_metrics = compute_multiclass_semantic_metrics(
+            coco_gt_dict=coco_gt_dict,
+            coco_predictions=coco_predictions,
+        )
+        semantic_miou = semantic_metrics["semantic_mIoU"]
+        semantic_macro_f1 = semantic_metrics["semantic_macro_F1"]
+        semantic_micro_f1 = semantic_metrics["semantic_micro_F1"]
+        semantic_pixel_acc = semantic_metrics["semantic_pixel_accuracy"]
+        semantic_num_classes = semantic_metrics["semantic_num_classes"]
+        metrics_result["semantic_mIoU"] = float(semantic_miou)
+        metrics_result["semantic_macro_F1"] = float(semantic_macro_f1)
+        metrics_result["semantic_micro_F1"] = float(semantic_micro_f1)
+        metrics_result["semantic_pixel_accuracy"] = float(semantic_pixel_acc)
+        metrics_result["semantic_num_classes"] = int(semantic_num_classes)
+        print(f"Semantic classes evaluated: {semantic_num_classes}")
+        print(f"Multi-class semantic mIoU: {semantic_miou:.4f}")
+        print(f"Multi-class pixel F1 (macro): {semantic_macro_f1:.4f}")
+        print(f"Multi-class pixel F1 (micro): {semantic_micro_f1:.4f}")
+        print(f"Pixel accuracy: {semantic_pixel_acc:.4f}")
 
         # Print summary
         print("\n" + "="*80)
@@ -1218,6 +1401,10 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         print(f"cgF1 (IoU 0.50:0.95): {cgf1:.4f}")
         print(f"cgF1@50: {cgf1_50:.4f}")
         print(f"cgF1@75: {cgf1_75:.4f}")
+        print(f"Semantic mIoU: {semantic_miou:.4f}")
+        print(f"Semantic pixel F1 (macro): {semantic_macro_f1:.4f}")
+        print(f"Semantic pixel F1 (micro): {semantic_micro_f1:.4f}")
+        print(f"Pixel accuracy: {semantic_pixel_acc:.4f}")
         print("="*80)
 
         # Cleanup temporary files
@@ -1229,6 +1416,8 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
 
     else:
         print("\n[ERROR] No predictions generated! Cannot compute metrics.")
+
+    return metrics_result
 
 
 if __name__ == "__main__":

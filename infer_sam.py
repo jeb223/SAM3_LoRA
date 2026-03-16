@@ -67,6 +67,10 @@ class SAM3LoRAInference:
         resolution: int = 1008,
         detection_threshold: float = 0.5,
         nms_iou_threshold: float = 0.5,
+        gamma_preprocess: float = 1.0,
+        use_clahe: bool = False,
+        clahe_clip_limit: float = 2.0,
+        clahe_tile_grid_size: int = 8,
         device: str = "cuda"
     ):
         """
@@ -78,6 +82,9 @@ class SAM3LoRAInference:
             resolution: Input image resolution (default: 1008)
             detection_threshold: Confidence threshold for detections (default: 0.5)
             nms_iou_threshold: IoU threshold for NMS (default: 0.5)
+            gamma_preprocess: Gamma correction factor applied before inference.
+                Values < 1 brighten dark images, values > 1 darken them.
+            use_clahe: Whether to apply CLAHE before inference.
             device: Device to run on (default: "cuda")
         """
         # Load config
@@ -97,6 +104,10 @@ class SAM3LoRAInference:
         self.resolution = resolution
         self.detection_threshold = detection_threshold
         self.nms_iou_threshold = nms_iou_threshold
+        self.gamma_preprocess = gamma_preprocess
+        self.use_clahe = use_clahe
+        self.clahe_clip_limit = clahe_clip_limit
+        self.clahe_tile_grid_size = clahe_tile_grid_size
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
 
         print(f"馃敡 Initializing SAM3 + LoRA...")
@@ -104,6 +115,13 @@ class SAM3LoRAInference:
         print(f"   Resolution: {resolution}x{resolution}")
         print(f"   Confidence threshold: {detection_threshold}")
         print(f"   NMS IoU threshold: {nms_iou_threshold}")
+        if abs(gamma_preprocess - 1.0) > 1e-6:
+            print(f"   Gamma preprocess: {gamma_preprocess}")
+        if use_clahe:
+            print(
+                "   CLAHE: "
+                f"clip_limit={clahe_clip_limit}, tile_grid={clahe_tile_grid_size}"
+            )
 
         # Build base model
         print("\n馃摝 Building SAM3 model...")
@@ -159,6 +177,46 @@ class SAM3LoRAInference:
         self.use_manual_postprocess = True
 
         print("鉁?SAM3 + LoRA ready for inference!\n")
+
+    def _apply_gamma_preprocess(self, pil_image: PILImage.Image) -> PILImage.Image:
+        if abs(self.gamma_preprocess - 1.0) < 1e-6:
+            return pil_image
+
+        image_np = np.asarray(pil_image).astype(np.float32) / 255.0
+        image_np = np.power(np.clip(image_np, 0.0, 1.0), self.gamma_preprocess)
+        image_np = np.clip(image_np, 0.0, 1.0)
+        return PILImage.fromarray((image_np * 255.0).astype(np.uint8))
+
+    def _apply_clahe_preprocess(self, pil_image: PILImage.Image) -> PILImage.Image:
+        if not self.use_clahe:
+            return pil_image
+
+        try:
+            import cv2
+        except ImportError as exc:
+            raise ImportError(
+                "CLAHE preprocessing requires OpenCV. Install opencv-python or disable --clahe."
+            ) from exc
+
+        rgb_np = np.asarray(pil_image)
+        lab = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2LAB)
+        l_channel, a_channel, b_channel = cv2.split(lab)
+        clahe = cv2.createCLAHE(
+            clipLimit=self.clahe_clip_limit,
+            tileGridSize=(self.clahe_tile_grid_size, self.clahe_tile_grid_size),
+        )
+        l_channel = clahe.apply(l_channel)
+        lab = cv2.merge([l_channel, a_channel, b_channel])
+        rgb_np = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+        return PILImage.fromarray(rgb_np)
+
+    def _preprocess_image_for_inference(
+        self, pil_image: PILImage.Image
+    ) -> PILImage.Image:
+        processed = pil_image
+        processed = self._apply_gamma_preprocess(processed)
+        processed = self._apply_clahe_preprocess(processed)
+        return processed
 
     def create_datapoint(self, pil_image: PILImage.Image, text_prompts: List[str]) -> Datapoint:
         """
@@ -229,10 +287,13 @@ class SAM3LoRAInference:
             raise FileNotFoundError(f"Image not found: {image_path}")
 
         # Load image
-        pil_image = PILImage.open(image_path).convert("RGB")
+        original_pil_image = PILImage.open(image_path).convert("RGB")
+        pil_image = self._preprocess_image_for_inference(original_pil_image)
         print(f"馃摲 Loaded image: {image_path}")
-        print(f"   Size: {pil_image.size}")
+        print(f"   Size: {original_pil_image.size}")
         print(f"   Prompts: {text_prompts}")
+        if pil_image is not original_pil_image:
+            print("   Applied low-light preprocessing before inference")
 
         print("\n馃敭 Running inference...")
 
@@ -278,7 +339,7 @@ class SAM3LoRAInference:
                 cx, cy, w, h = boxes_cxcywh.unbind(-1)
 
                 # Convert to xyxy and scale to original image size
-                orig_w, orig_h = pil_image.size
+                orig_w, orig_h = original_pil_image.size
                 x1 = (cx - w / 2) * orig_w
                 y1 = (cy - h / 2) * orig_h
                 x2 = (cx + w / 2) * orig_w
@@ -329,7 +390,9 @@ class SAM3LoRAInference:
                 print(f"   '{prompt}': 0 detections")
 
         # Store original image for visualization
-        results['_image'] = pil_image
+        results['_image'] = original_pil_image
+        if pil_image is not original_pil_image:
+            results['_model_image'] = pil_image
 
         return results
 
@@ -359,9 +422,10 @@ class SAM3LoRAInference:
         colors = ['red', 'blue', 'green', 'yellow', 'cyan', 'magenta']
 
         total_detections = 0
+        result_indices = sorted([k for k in results.keys() if isinstance(k, int)])
 
         # Draw results for each prompt
-        for idx in sorted([k for k in results.keys() if k != '_image']):
+        for idx in result_indices:
             result = results[idx]
             prompt = result['prompt']
             color = colors[idx % len(colors)]
@@ -429,7 +493,7 @@ class SAM3LoRAInference:
         ax.axis('off')
 
         # Add title with all prompts
-        prompts_str = ", ".join([f'"{results[k]["prompt"]}"' for k in sorted([k for k in results.keys() if k != '_image'])])
+        prompts_str = ", ".join([f'"{results[k]["prompt"]}"' for k in result_indices])
         plt.suptitle(f'Text Prompts: {prompts_str}', fontsize=12, y=0.98)
 
         plt.tight_layout()
@@ -502,6 +566,29 @@ def main():
         default=0.5,
         help="NMS IoU threshold (default: 0.5, lower = fewer overlapping boxes)"
     )
+    parser.add_argument(
+        "--gamma-preprocess",
+        type=float,
+        default=1.0,
+        help="Apply gamma correction before inference. Values < 1 brighten dark images."
+    )
+    parser.add_argument(
+        "--clahe",
+        action="store_true",
+        help="Apply CLAHE to the luminance channel before inference."
+    )
+    parser.add_argument(
+        "--clahe-clip-limit",
+        type=float,
+        default=2.0,
+        help="CLAHE clip limit (default: 2.0)"
+    )
+    parser.add_argument(
+        "--clahe-tile-grid-size",
+        type=int,
+        default=8,
+        help="CLAHE tile grid size (default: 8)"
+    )
 
     args = parser.parse_args()
 
@@ -511,7 +598,11 @@ def main():
         weights_path=args.weights,
         resolution=args.resolution,
         detection_threshold=args.threshold,
-        nms_iou_threshold=args.nms_iou
+        nms_iou_threshold=args.nms_iou,
+        gamma_preprocess=args.gamma_preprocess,
+        use_clahe=args.clahe,
+        clahe_clip_limit=args.clahe_clip_limit,
+        clahe_tile_grid_size=args.clahe_tile_grid_size,
     )
 
     # Run inference
@@ -528,7 +619,7 @@ def main():
     # Print summary
     print("\n" + "="*60)
     print("馃搳 Summary:")
-    for idx in sorted([k for k in results.keys() if k != '_image']):
+    for idx in sorted([k for k in results.keys() if isinstance(k, int)]):
         result = results[idx]
         print(f"   Prompt '{result['prompt']}': {result['num_detections']} detections")
         if result['num_detections'] > 0 and result['scores'] is not None:

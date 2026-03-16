@@ -579,6 +579,16 @@ class CGF1Evaluator:
         self.use_cats = use_cats
 
         self.coco_gts = [COCOCustom(gt) for gt in self.gt_paths]
+        self.eval_cat_ids = None
+        if self.use_cats:
+            # Closed-set evaluation: always score against the full category set
+            # declared by the ground-truth files, so image-level TNs are counted.
+            eval_cat_ids = set()
+            for coco_gt in self.coco_gts:
+                eval_cat_ids.update(int(cat_id) for cat_id in coco_gt.getCatIds())
+            self.eval_cat_ids = sorted(eval_cat_ids)
+            if not self.eval_cat_ids:
+                self.eval_cat_ids = [1]
 
         self.verbose = verbose
 
@@ -591,6 +601,8 @@ class CGF1Evaluator:
                     useCats=use_cats,
                 )
             )
+            if self.use_cats:
+                self.coco_evals[-1].params.catIds = self.eval_cat_ids
 
         exclude_img_ids = set()
         # exclude_img_ids are the ids that are not exhaustively annotated in any of the other gts
@@ -638,19 +650,6 @@ class CGF1Evaluator:
         all_eval_imgs = []
         for img_id in tqdm(self.eval_img_ids, disable=not self.verbose):
             results = img2preds[img_id]
-            active_cat_ids = None
-            if self.use_cats:
-                active_cat_ids = {int(pred["category_id"]) for pred in results}
-                for cur_coco_gt in self.coco_gts:
-                    active_cat_ids.update(
-                        int(ann["category_id"])
-                        for ann in cur_coco_gt.imgToAnns.get(img_id, [])
-                    )
-                if not active_cat_ids:
-                    fallback_cat_ids = self.coco_gts[0].getCatIds()
-                    active_cat_ids = {int(fallback_cat_ids[0]) if fallback_cat_ids else 1}
-                active_cat_ids = sorted(active_cat_ids)
-
             all_scorings = []
             for cur_coco_gt, coco_eval in zip(self.coco_gts, self.coco_evals):
                 # suppress pycocotools prints
@@ -664,7 +663,7 @@ class CGF1Evaluator:
                 coco_eval.params.imgIds = [img_id]
                 coco_eval.params.useCats = self.use_cats
                 if self.use_cats:
-                    coco_eval.params.catIds = active_cat_ids
+                    coco_eval.params.catIds = self.eval_cat_ids
                 img_ids, eval_imgs = _evaluate(coco_eval)
                 all_scorings.append(eval_imgs)
             selected = self._select_best_scoring(all_scorings)
@@ -676,6 +675,8 @@ class CGF1Evaluator:
         self.coco_evals[0].evalImgs = all_eval_imgs
         self.coco_evals[0].params.imgIds = self.eval_img_ids
         self.coco_evals[0].params.useCats = self.use_cats
+        if self.use_cats:
+            self.coco_evals[0].params.catIds = self.eval_cat_ids
         self.coco_evals[0]._paramsEval = copy.deepcopy(self.coco_evals[0].params)
 
         if self.verbose:

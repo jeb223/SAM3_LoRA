@@ -9,8 +9,8 @@ model:
 
 # LoRA settings - REDUCED for memory efficiency
 lora:
-  rank: 8                   # Reduced from 32 (less capacity but faster)
-  alpha: 16                  # 2x rank
+  rank: 16                   # Reduced from 32 (less capacity but faster)
+  alpha: 32                  # 2x rank
   dropout: 0.05
 
   # Target ONLY attention layers (skip MLP for memory savings)
@@ -21,8 +21,7 @@ lora:
     - "out_proj"
     - "qkv"                  # Fused Q/K/V projection in vision backbone
     - "proj"                 # Output projection in vision backbone attention
-    - "fc1"                  # Vision backbone MLP first layer
-    - "fc2"                  # Vision backbone MLP second layer
+
     # NOT including fc1/fc2 - saves memory
 
   # Apply LoRA to FEWER components (memory optimization)
@@ -58,6 +57,25 @@ training:
   mixed_precision: "bf16"
   seed: 42
   gradient_accumulation_steps: 8  # Effective batch = 2 × 8 = 16
+
+  low_light_augmentation:
+    enabled: true
+    probability: 0.5
+    brightness_range: [0.35, 1.0]
+    contrast_range: [0.7, 1.25]
+    gamma_range: [1.0, 2.2]
+    noise_std_range: [0.0, 0.04]
+    blur_radius_range: [0.0, 1.2]
+    flashlight_prob: 0.35
+    flashlight_darkness_range: [0.12, 0.4]
+    flashlight_gain_range: [0.7, 1.3]
+    flashlight_sigma_range: [0.18, 0.4]
+    grayscale_prob: 0.05
+
+  boundary_optimization:
+    enabled: true
+    loss_weight: 20.0
+    dice_weight: 5.0
 
 output:
   output_dir: "outputs/sam3_lora_my"

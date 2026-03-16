@@ -11,6 +11,12 @@ import torch.utils.checkpoint as checkpoint
 from .model_misc import MLP
 
 
+def _mark_trainable_adapter(module: nn.Module) -> nn.Module:
+    """Mark lightweight residual adapters so LoRA setup can keep them trainable."""
+    module._sam3_trainable_adapter = True
+    return module
+
+
 class LinearPresenceHead(nn.Sequential):
     def __init__(self, d_model):
         # a hack to make `LinearPresenceHead` compatible with old checkpoints
@@ -51,6 +57,81 @@ class MaskPredictor(nn.Module):
         return mask_preds
 
 
+class MultiScaleFusionAdapter(nn.Module):
+    """Residual fusion block on top of the original top-down FPN path."""
+
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.residual_scale = nn.Parameter(torch.zeros(1))
+        self.fusion = nn.Sequential(
+            nn.Conv2d(hidden_dim * 2, hidden_dim, kernel_size=1),
+            nn.GroupNorm(8, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=1, padding=1),
+            nn.GroupNorm(8, hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+
+    @staticmethod
+    def _match_batch_dim(curr_fpn, prev_fpn_upsampled):
+        """
+        Preserve the original PixelDecoder broadcasting behavior.
+
+        The old implementation used `curr_fpn + prev_fpn_upsampled`, which allows
+        singleton batch dimensions to broadcast (e.g. [1, C, H, W] + [B, C, H, W]).
+        Our concat-based fusion needs the batch dimensions to match explicitly.
+        """
+        if curr_fpn.shape[0] == prev_fpn_upsampled.shape[0]:
+            return curr_fpn, prev_fpn_upsampled
+
+        if curr_fpn.shape[0] == 1:
+            curr_fpn = curr_fpn.expand(
+                prev_fpn_upsampled.shape[0], -1, -1, -1
+            )
+            return curr_fpn, prev_fpn_upsampled
+
+        if prev_fpn_upsampled.shape[0] == 1:
+            prev_fpn_upsampled = prev_fpn_upsampled.expand(
+                curr_fpn.shape[0], -1, -1, -1
+            )
+            return curr_fpn, prev_fpn_upsampled
+
+        raise RuntimeError(
+            "MultiScaleFusionAdapter got incompatible batch dimensions: "
+            f"{tuple(curr_fpn.shape)} vs {tuple(prev_fpn_upsampled.shape)}"
+        )
+
+    def forward(self, curr_fpn, prev_fpn_upsampled):
+        curr_fpn, prev_fpn_upsampled = self._match_batch_dim(
+            curr_fpn, prev_fpn_upsampled
+        )
+        residual = self.fusion(torch.cat([curr_fpn, prev_fpn_upsampled], dim=1))
+        return curr_fpn + prev_fpn_upsampled + self.residual_scale * residual
+
+
+class BoundaryRefinementAdapter(nn.Module):
+    """Lightweight boundary stream that refines pixel features and predicts edges."""
+
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.residual_scale = nn.Parameter(torch.zeros(1))
+        self.refine = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=1, padding=1),
+            nn.GroupNorm(8, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=1, padding=1),
+            nn.GroupNorm(8, hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.boundary_head = nn.Conv2d(hidden_dim, 1, kernel_size=1)
+
+    def forward(self, pixel_embed):
+        boundary_features = self.refine(pixel_embed)
+        enhanced_pixel_embed = pixel_embed + self.residual_scale * boundary_features
+        boundary_logits = self.boundary_head(boundary_features)
+        return enhanced_pixel_embed, boundary_logits
+
+
 class SegmentationHead(nn.Module):
     def __init__(
         self,
@@ -83,6 +164,10 @@ class SegmentationHead(nn.Module):
             )
         else:
             self.mask_predictor = MaskPredictor(hidden_dim, mask_dim=hidden_dim)
+
+        self.boundary_adapter = _mark_trainable_adapter(
+            BoundaryRefinementAdapter(self.pixel_decoder.out_dim)
+        )
 
         self.act_ckpt = act_ckpt
 
@@ -158,6 +243,7 @@ class SegmentationHead(nn.Module):
             image_ids=image_ids,
             encoder_hidden_states=encoder_hidden_states,
         )
+        pixel_embed, pred_boundaries = self.boundary_adapter(pixel_embed)
 
         if self.no_dec:
             mask_pred = self.mask_predictor(pixel_embed)
@@ -166,7 +252,7 @@ class SegmentationHead(nn.Module):
         else:
             mask_pred = self.mask_predictor(obj_queries[-1], pixel_embed)
 
-        return {"pred_masks": mask_pred}
+        return {"pred_masks": mask_pred, "pred_boundaries": pred_boundaries}
 
 
 class PixelDecoder(nn.Module):
@@ -191,6 +277,12 @@ class PixelDecoder(nn.Module):
 
         self.conv_layers = nn.ModuleList(conv_layers)
         self.norms = nn.ModuleList(norms)
+        self.fusion_adapters = nn.ModuleList(
+            [
+                _mark_trainable_adapter(MultiScaleFusionAdapter(self.hidden_dim))
+                for _ in range(num_upsampling_stages)
+            ]
+        )
         self.shared_conv = shared_conv
         self.out_dim = self.conv_layers[-1].out_channels
         if compile_mode is not None:
@@ -207,9 +299,10 @@ class PixelDecoder(nn.Module):
         fpn_feats = backbone_feats[:-1]
         for layer_idx, bb_feat in enumerate(fpn_feats[::-1]):
             curr_fpn = bb_feat
-            prev_fpn = curr_fpn + F.interpolate(
+            prev_fpn_up = F.interpolate(
                 prev_fpn, size=curr_fpn.shape[-2:], mode=self.interpolation_mode
             )
+            prev_fpn = self.fusion_adapters[layer_idx](curr_fpn, prev_fpn_up)
             if self.shared_conv:
                 # only one conv layer
                 layer_idx = 0
@@ -306,6 +399,7 @@ class UniversalSegmentationHead(SegmentationHead):
             image_ids=image_ids,
             encoder_hidden_states=encoder_hidden_states,
         )
+        pixel_embed, pred_boundaries = self.boundary_adapter(pixel_embed)
 
         instance_embeds = self.instance_seg_head(pixel_embed)
 
@@ -318,6 +412,7 @@ class UniversalSegmentationHead(SegmentationHead):
 
         return {
             "pred_masks": mask_pred,
+            "pred_boundaries": pred_boundaries,
             "semantic_seg": self.semantic_seg_head(pixel_embed),
             "presence_logit": presence_logit,
         }

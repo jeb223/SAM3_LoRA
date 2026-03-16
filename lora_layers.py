@@ -545,6 +545,21 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> nn.Module:
     if len(lora_modules_applied) > 15:
         print(f"  ... and {len(lora_modules_applied) - 15} more")
 
+    # STEP 3: Re-enable lightweight trainable adapters added on top of the frozen base model
+    adapter_modules_enabled = []
+    for name, module in model.named_modules():
+        if getattr(module, "_sam3_trainable_adapter", False):
+            for param in module.parameters():
+                param.requires_grad = True
+            adapter_modules_enabled.append(name)
+
+    if adapter_modules_enabled:
+        print(f"Enabled {len(adapter_modules_enabled)} trainable adapter modules:")
+        for module_name in adapter_modules_enabled[:10]:
+            print(f"  - {module_name}")
+        if len(adapter_modules_enabled) > 10:
+            print(f"  ... and {len(adapter_modules_enabled) - 10} more")
+
     return model
 
 
@@ -584,30 +599,30 @@ def count_parameters(model: nn.Module) -> Dict[str, int]:
 
 def save_lora_weights(model: nn.Module, save_path: str):
     """
-    Save only LoRA weights (not the full model).
+    Save all trainable adaptation weights (LoRA + lightweight adapters).
 
     Args:
         model: Model with LoRA layers
         save_path: Path to save LoRA weights
     """
-    lora_state_dict = {}
-    for name, module in model.named_modules():
-        if isinstance(module, LoRALayer):
-            lora_state_dict[f"{name}.lora_A"] = module.lora_A
-            lora_state_dict[f"{name}.lora_B"] = module.lora_B
+    lora_state_dict = {
+        name: param.detach().cpu()
+        for name, param in model.named_parameters()
+        if param.requires_grad
+    }
 
     torch.save(lora_state_dict, save_path)
-    print(f"Saved LoRA weights to {save_path}")
+    print(f"Saved adaptation weights to {save_path}")
 
 
 def load_lora_weights(model: nn.Module, load_path: str):
     """
-    Load LoRA weights into a model.
+    Load saved adaptation weights into a model.
 
     Args:
         model: Model with LoRA layers
         load_path: Path to LoRA weights
     """
-    lora_state_dict = torch.load(load_path)
+    lora_state_dict = torch.load(load_path, map_location="cpu")
     model.load_state_dict(lora_state_dict, strict=False)
-    print(f"Loaded LoRA weights from {load_path}")
+    print(f"Loaded adaptation weights from {load_path}")

@@ -54,7 +54,7 @@ from lora_layers import LoRAConfig, apply_lora_to_model, save_lora_weights, coun
 
 from torchvision.transforms import v2
 import pycocotools.mask as mask_utils  # Required for RLE mask decoding in COCO dataset
-from sam3.train.masks_ops import compute_boundary, rle_encode  # For encoding masks to RLE format
+from sam3.train.masks_ops import rle_encode  # For encoding masks to RLE format
 
 # Note: Evaluation modules (mAP, cgF1, NMS) are in validate_sam3_lora.py
 # Training only computes validation loss, following SAM3's approach
@@ -981,22 +981,11 @@ class SAM3TrainerNative:
             enabled=self.device.type == "cuda" and mixed_precision == "fp16"
         )
 
-        boundary_cfg = train_cfg.get("boundary_optimization", {})
-        self.boundary_enabled = bool(boundary_cfg.get("enabled", True))
-        self.boundary_loss_weight = float(boundary_cfg.get("loss_weight", 20.0))
-        self.boundary_dice_weight = float(boundary_cfg.get("dice_weight", 5.0))
-
         print_rank0(
             f"Mixed precision: {mixed_precision} "
             f"(enabled={self.amp_enabled}, dtype={self.amp_dtype})"
         )
         print_rank0(f"Gradient accumulation steps: {self.grad_accum_steps}")
-        print_rank0(
-            "Boundary optimization: "
-            f"enabled={self.boundary_enabled}, "
-            f"loss_weight={self.boundary_loss_weight}, "
-            f"dice_weight={self.boundary_dice_weight}"
-        )
         
         # Matcher & Loss
         self.matcher = BinaryHungarianMatcherV2(
@@ -1050,90 +1039,6 @@ class SAM3TrainerNative:
             normalization="local",  # Use local normalization (no distributed training)
             normalize_by_valid_object_num=False,
         )
-
-    @staticmethod
-    def _compute_boundary_dice_loss(logits, targets):
-        probs = logits.sigmoid()
-        probs = probs.flatten(1)
-        targets = targets.flatten(1)
-        intersection = 2.0 * (probs * targets).sum(dim=1)
-        denominator = probs.sum(dim=1) + targets.sum(dim=1)
-        return 1.0 - ((intersection + 1.0) / (denominator + 1.0)).mean()
-
-    def _build_query_boundary_targets(self, stage_targets, device):
-        if stage_targets["masks"] is None:
-            return None
-
-        masks = stage_targets["masks"].to(device=device, dtype=torch.bool)
-        is_valid_mask = stage_targets["is_valid_mask"].to(device=device, dtype=torch.bool)
-        num_boxes = stage_targets["num_boxes"].tolist()
-
-        query_boundaries = []
-        start = 0
-        height, width = masks.shape[-2:]
-        for count in num_boxes:
-            end = start + int(count)
-            if count == 0:
-                semantic_mask = torch.zeros((height, width), device=device, dtype=torch.bool)
-            else:
-                valid_masks = masks[start:end][is_valid_mask[start:end]]
-                if valid_masks.numel() == 0:
-                    semantic_mask = torch.zeros((height, width), device=device, dtype=torch.bool)
-                else:
-                    semantic_mask = valid_masks.any(dim=0)
-            query_boundaries.append(compute_boundary(semantic_mask).float())
-            start = end
-
-        if not query_boundaries:
-            return None
-
-        return torch.stack(query_boundaries, dim=0).unsqueeze(1)
-
-    def _compute_boundary_loss(self, outputs_list, find_targets):
-        if not self.boundary_enabled:
-            return torch.tensor(0.0, device=self.device)
-
-        total_boundary_loss = torch.tensor(0.0, device=self.device)
-        num_terms = 0
-
-        with SAM3Output.iteration_mode(
-            outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
-        ) as outputs_iter:
-            for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
-                final_outputs = stage_outputs[-1]
-                if "pred_boundaries" not in final_outputs:
-                    continue
-
-                target_boundaries = self._build_query_boundary_targets(
-                    stage_targets, device=final_outputs["pred_boundaries"].device
-                )
-                if target_boundaries is None:
-                    continue
-
-                pred_boundaries = final_outputs["pred_boundaries"]
-                if pred_boundaries.dtype == torch.bfloat16:
-                    pred_boundaries = pred_boundaries.float()
-                if pred_boundaries.shape[-2:] != target_boundaries.shape[-2:]:
-                    pred_boundaries = torch.nn.functional.interpolate(
-                        pred_boundaries,
-                        size=target_boundaries.shape[-2:],
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-
-                bce = torch.nn.functional.binary_cross_entropy_with_logits(
-                    pred_boundaries, target_boundaries
-                )
-                dice = self._compute_boundary_dice_loss(pred_boundaries, target_boundaries)
-                total_boundary_loss = total_boundary_loss + (
-                    self.boundary_loss_weight * bce
-                    + self.boundary_dice_weight * dice
-                )
-                num_terms += 1
-
-        if num_terms == 0:
-            return torch.tensor(0.0, device=self.device)
-        return total_boundary_loss / num_terms
         
     def train(self):
         # Get data directory from config (should point to directory containing train/valid folders)
@@ -1332,10 +1237,8 @@ class SAM3TrainerNative:
                         # This handles num_boxes calculation and proper weighting
                         loss_dict = self.loss_wrapper(outputs_list, find_targets)
 
-                        boundary_loss = self._compute_boundary_loss(outputs_list, find_targets)
-
                         # Extract total loss
-                        total_loss = loss_dict[CORE_LOSS_KEY] + boundary_loss
+                        total_loss = loss_dict[CORE_LOSS_KEY]
                         loss_for_backward = total_loss / self.grad_accum_steps
 
                     # Backward (scaled for gradient accumulation)
@@ -1363,10 +1266,7 @@ class SAM3TrainerNative:
 
                 # Track training loss
                 train_losses.append(total_loss.item())
-                pbar.set_postfix({
-                    "loss": total_loss.item(),
-                    "boundary": float(boundary_loss.item()) if self.boundary_enabled else 0.0,
-                })
+                pbar.set_postfix({"loss": total_loss.item()})
 
             # Calculate average training loss for this epoch
             avg_train_loss = sum(train_losses) / len(train_losses) if train_losses else 0.0
@@ -1410,8 +1310,7 @@ class SAM3TrainerNative:
 
                         # Compute loss using Sam3LossWrapper
                         loss_dict = self.loss_wrapper(outputs_list, find_targets)
-                        boundary_loss = self._compute_boundary_loss(outputs_list, find_targets)
-                        total_loss = loss_dict[CORE_LOSS_KEY] + boundary_loss
+                        total_loss = loss_dict[CORE_LOSS_KEY]
 
                         val_losses.append(total_loss.item())
                         val_pbar.set_postfix({"val_loss": total_loss.item()})
