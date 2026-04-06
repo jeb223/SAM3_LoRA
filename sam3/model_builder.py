@@ -201,13 +201,25 @@ def _create_dot_product_scoring():
     return DotProductScoring(d_model=256, d_proj=256, prompt_mlp=prompt_mlp)
 
 
-def _create_segmentation_head(compile_mode=None):
+def _create_segmentation_head(
+    compile_mode=None,
+    use_srf_lite=False,
+    srf_num_levels=4,
+    srf_bottleneck_dim=None,
+    srf_interpolation_mode="bilinear",
+    srf_alpha_init=0.0,
+):
     """Create segmentation head with pixel decoder."""
     pixel_decoder = PixelDecoder(
         num_upsampling_stages=3,
         interpolation_mode="nearest",
         hidden_dim=256,
         compile_mode=compile_mode,
+        use_srf_lite=use_srf_lite,
+        srf_num_levels=srf_num_levels,
+        srf_bottleneck_dim=srf_bottleneck_dim,
+        srf_interpolation_mode=srf_interpolation_mode,
+        srf_alpha_init=srf_alpha_init,
     )
 
     cross_attend_prompt = MultiheadAttention(
@@ -563,6 +575,11 @@ def build_sam3_image_model(
     enable_segmentation=True,
     enable_inst_interactivity=False,
     compile=False,
+    use_srf_lite=False,
+    srf_num_levels=4,
+    srf_bottleneck_dim=None,
+    srf_interpolation_mode="bilinear",
+    srf_alpha_init=0.0,
 ):
     """
     Build SAM3 image model
@@ -603,7 +620,14 @@ def build_sam3_image_model(
 
     # Create segmentation head if enabled
     segmentation_head = (
-        _create_segmentation_head(compile_mode=compile_mode)
+        _create_segmentation_head(
+            compile_mode=compile_mode,
+            use_srf_lite=use_srf_lite,
+            srf_num_levels=srf_num_levels,
+            srf_bottleneck_dim=srf_bottleneck_dim,
+            srf_interpolation_mode=srf_interpolation_mode,
+            srf_alpha_init=srf_alpha_init,
+        )
         if enable_segmentation
         else None
     )

@@ -125,12 +125,19 @@ class SAM3LoRAInference:
 
         # Build base model
         print("\n馃摝 Building SAM3 model...")
+        model_cfg = self.config.get("model", {})
+        srf_cfg = model_cfg.get("srf_lite", {})
         self.model = build_sam3_image_model(
             device=self.device.type,
             compile=False,
             load_from_HF=True,
             bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
-            eval_mode=True
+            eval_mode=True,
+            use_srf_lite=bool(srf_cfg.get("enabled", False)),
+            srf_num_levels=int(srf_cfg.get("num_levels", 4)),
+            srf_bottleneck_dim=srf_cfg.get("bottleneck_dim", None),
+            srf_interpolation_mode=str(srf_cfg.get("interpolation_mode", "bilinear")),
+            srf_alpha_init=float(srf_cfg.get("alpha_init", 0.0)),
         )
 
         # Apply LoRA configuration
@@ -629,6 +636,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 

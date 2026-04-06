@@ -10,7 +10,6 @@ import yaml
 import json
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from collections import defaultdict
@@ -720,131 +719,6 @@ def compute_multiclass_semantic_metrics(coco_gt_dict, coco_predictions):
     }
 
 
-def compute_multiclass_semantic_metrics_from_prob_maps(
-    coco_gt_dict, semantic_prob_maps, threshold=0.5
-):
-    """
-    Compute semantic metrics from the semantic head's dense probability maps.
-
-    `semantic_prob_maps` is expected to be:
-      image_id -> {category_id -> probability_map(H, W)}
-    """
-    categories = coco_gt_dict.get("categories", [])
-    sorted_cat_ids = sorted(int(cat["id"]) for cat in categories)
-    if not sorted_cat_ids:
-        return {
-            "semantic_mIoU": 0.0,
-            "semantic_macro_F1": 0.0,
-            "semantic_micro_F1": 0.0,
-            "semantic_pixel_accuracy": 0.0,
-            "semantic_num_classes": 0,
-        }
-
-    cat_id_to_index = {cat_id: idx + 1 for idx, cat_id in enumerate(sorted_cat_ids)}
-    num_labels = len(sorted_cat_ids) + 1  # background = 0
-
-    images_by_id = {int(img["id"]): img for img in coco_gt_dict.get("images", [])}
-
-    gt_by_image = defaultdict(list)
-    for ann in coco_gt_dict.get("annotations", []):
-        gt_by_image[int(ann["image_id"])].append(ann)
-
-    confusion = np.zeros((num_labels, num_labels), dtype=np.int64)
-
-    for image_id, image_info in images_by_id.items():
-        height = int(image_info["height"])
-        width = int(image_info["width"])
-
-        gt_semantic = np.zeros((height, width), dtype=np.int32)
-        for ann in gt_by_image.get(image_id, []):
-            cat_id = int(ann["category_id"])
-            if cat_id not in cat_id_to_index or "segmentation" not in ann:
-                continue
-            mask = mask_utils.decode(ann["segmentation"])
-            if mask.ndim == 3:
-                mask = mask[..., 0]
-            gt_semantic[mask.astype(bool)] = cat_id_to_index[cat_id]
-
-        pred_semantic = np.zeros((height, width), dtype=np.int32)
-        pred_score_map = np.zeros((height, width), dtype=np.float32)
-        image_prob_maps = semantic_prob_maps.get(image_id, {})
-        for cat_id, prob_map in image_prob_maps.items():
-            cat_id = int(cat_id)
-            if cat_id not in cat_id_to_index:
-                continue
-
-            prob_map = np.asarray(prob_map, dtype=np.float32)
-            if prob_map.shape != (height, width):
-                prob_tensor = torch.from_numpy(prob_map).float().unsqueeze(0).unsqueeze(0)
-                prob_map = (
-                    F.interpolate(
-                        prob_tensor,
-                        size=(height, width),
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                    .squeeze()
-                    .cpu()
-                    .numpy()
-                    .astype(np.float32)
-                )
-
-            overwrite = prob_map >= pred_score_map
-            pred_semantic[overwrite] = cat_id_to_index[cat_id]
-            pred_score_map[overwrite] = prob_map[overwrite]
-
-        pred_semantic[pred_score_map < float(threshold)] = 0
-
-        combined = num_labels * gt_semantic.reshape(-1) + pred_semantic.reshape(-1)
-        confusion += np.bincount(
-            combined,
-            minlength=num_labels * num_labels,
-        ).reshape(num_labels, num_labels)
-
-    tp = np.diag(confusion).astype(np.float64)
-    gt_pixels = confusion.sum(axis=1).astype(np.float64)
-    pred_pixels = confusion.sum(axis=0).astype(np.float64)
-
-    fg_tp = tp[1:]
-    fg_gt = gt_pixels[1:]
-    fg_pred = pred_pixels[1:]
-
-    class_union = fg_gt + fg_pred - fg_tp
-    class_iou = np.divide(
-        fg_tp,
-        class_union,
-        out=np.zeros_like(fg_tp),
-        where=class_union > 0,
-    )
-    class_f1 = np.divide(
-        2.0 * fg_tp,
-        fg_gt + fg_pred,
-        out=np.zeros_like(fg_tp),
-        where=(fg_gt + fg_pred) > 0,
-    )
-
-    valid_iou = class_union > 0
-    valid_f1 = (fg_gt + fg_pred) > 0
-
-    total_fg_tp = float(fg_tp.sum())
-    total_fg_fp = float((fg_pred - fg_tp).sum())
-    total_fg_fn = float((fg_gt - fg_tp).sum())
-    semantic_micro_f1 = (
-        (2.0 * total_fg_tp) / (2.0 * total_fg_tp + total_fg_fp + total_fg_fn + 1e-6)
-    )
-
-    total_pixels = float(confusion.sum())
-    semantic_pixel_accuracy = float(tp.sum()) / (total_pixels + 1e-6)
-
-    return {
-        "semantic_mIoU": float(class_iou[valid_iou].mean()) if np.any(valid_iou) else 0.0,
-        "semantic_macro_F1": float(class_f1[valid_f1].mean()) if np.any(valid_f1) else 0.0,
-        "semantic_micro_F1": float(semantic_micro_f1),
-        "semantic_pixel_accuracy": float(semantic_pixel_accuracy),
-        "semantic_num_classes": len(sorted_cat_ids),
-    }
-
-
 def run_coco_eval(coco_gt, coco_dt, iou_type):
     """Run COCO evaluation for a specific IoU type and print the summary."""
     with open(os.devnull, 'w') as devnull:
@@ -858,7 +732,15 @@ def run_coco_eval(coco_gt, coco_dt, iou_type):
     return coco_eval
 
 
-def convert_predictions_to_coco_format_original_res(predictions_list, image_ids, dataset, model_resolution=288, score_threshold=0.0, merge_overlaps=True, iou_threshold=0.3, debug=False, category_ids=None):
+def convert_predictions_to_coco_format_original_res(predictions_list, image_ids, dataset,
+                                                    model_resolution=288,
+                                                    prob_threshold=0.3,
+                                                    nms_iou_threshold=0.7,
+                                                    max_detections=100,
+                                                    merge_cracks=False,
+                                                    merge_iou_threshold=0.15,
+                                                    debug=False,
+                                                    category_ids=None):
     """
     Convert model predictions to COCO format at ORIGINAL image resolution.
 
@@ -869,13 +751,15 @@ def convert_predictions_to_coco_format_original_res(predictions_list, image_ids,
 
     Args:
         predictions_list: List of predictions per query-item
-        image_ids: List of image IDs (indices into dataset)
-        dataset: Dataset to get original image sizes
+        image_ids: List of COCO image IDs aligned with predictions_list
+        dataset: Dataset that provides original image sizes via dataset.images
         category_ids: List of COCO category IDs aligned with predictions_list
         model_resolution: Model output resolution (default: 288)
-        score_threshold: Confidence threshold
-        merge_overlaps: Whether to merge overlapping predictions
-        iou_threshold: IoU threshold for merging
+        prob_threshold: Confidence threshold for filtering predictions
+        nms_iou_threshold: NMS IoU threshold
+        max_detections: Maximum detections per image
+        merge_cracks: Whether to merge overlapping predictions instead of NMS
+        merge_iou_threshold: IoU threshold for merging
         debug: Print debug info
     """
     if category_ids is None:
@@ -887,103 +771,110 @@ def convert_predictions_to_coco_format_original_res(predictions_list, image_ids,
 
     coco_predictions = []
     pred_id = 0
+    coco_id_to_image = {int(coco_id): img for coco_id, img in dataset.images.items()}
 
     if debug:
         print(f"\n[DEBUG] Converting {len(predictions_list)} predictions to COCO format (ORIGINAL RESOLUTION)...")
-        if merge_overlaps:
-            print(f"[DEBUG] Overlapping segment merging ENABLED (IoU threshold={iou_threshold})")
+        if merge_cracks:
+            print(f"[DEBUG] Overlapping segment merging ENABLED (IoU threshold={merge_iou_threshold})")
 
     for img_id, preds, category_id in zip(image_ids, predictions_list, category_ids):
         if preds is None or len(preds.get('pred_logits', [])) == 0:
             continue
 
-        # Get original image size from dataset
-        datapoint = dataset[img_id]
-        orig_h, orig_w = datapoint.find_queries[0].inference_metadata.original_size
+        coco_image_id = int(img_id)
+        image_info = coco_id_to_image.get(coco_image_id)
+        if image_info is None:
+            if debug:
+                print(f"[DEBUG] Skipping unknown COCO image id: {coco_image_id}")
+            continue
+        orig_w = int(image_info["width"])
+        orig_h = int(image_info["height"])
 
         logits = preds['pred_logits']
         boxes = preds['pred_boxes']
-        masks = preds['pred_masks']  # [N, 288, 288]
+        masks = preds['pred_masks']  # [N, H, W]
 
-        scores = torch.sigmoid(logits).squeeze(-1)
+        if merge_cracks:
+            pred_probs = torch.sigmoid(logits).squeeze(-1)
+            valid_mask = pred_probs > prob_threshold
+            filtered_masks = masks[valid_mask]
+            filtered_scores = pred_probs[valid_mask]
+            filtered_boxes = boxes[valid_mask]
 
-        # Filter by score threshold
-        valid_mask = scores > score_threshold
-        num_before = len(scores)
-        scores = scores[valid_mask]
-        boxes = boxes[valid_mask]
-        masks = masks[valid_mask]
+            if len(filtered_masks) == 0:
+                continue
 
-        if debug and img_id == image_ids[0]:
-            print(f"[DEBUG] Image {img_id}: {num_before} queries -> {len(scores)} after filtering (threshold={score_threshold})")
-            if len(scores) > 0:
-                print(f"[DEBUG]   Original size: {orig_w}x{orig_h}")
-                print(f"[DEBUG]   Filtered scores: min={scores.min():.4f}, max={scores.max():.4f}, mean={scores.mean():.4f}")
+            pred_masks_sigmoid = torch.sigmoid(filtered_masks)
+            masks_upsampled = torch.nn.functional.interpolate(
+                pred_masks_sigmoid.unsqueeze(1).float(),
+                size=(orig_h, orig_w),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(1)
+            pred_masks_binary = masks_upsampled > 0.5
 
-        if len(masks) == 0:
-            continue
-
-        # Upsample masks from 288x288 to original resolution (like infer_sam.py)
-        masks_sigmoid = torch.sigmoid(masks)  # [N, 288, 288]
-        masks_upsampled = torch.nn.functional.interpolate(
-            masks_sigmoid.unsqueeze(1).float(),  # [N, 1, 288, 288]
-            size=(orig_h, orig_w),
-            mode='bilinear',
-            align_corners=False
-        ).squeeze(1)  # [N, orig_h, orig_w]
-
-        binary_masks = (masks_upsampled > 0.5).cpu()
-
-        # Merge overlapping predictions
-        if merge_overlaps and len(binary_masks) > 0:
-            num_before_merge = len(binary_masks)
-            binary_masks, scores, boxes = merge_overlapping_masks(
-                binary_masks, scores.cpu(), boxes.cpu(), iou_threshold=iou_threshold
+            merged_masks, merged_scores, merged_boxes = merge_overlapping_masks(
+                pred_masks_binary.cpu(),
+                filtered_scores.cpu(),
+                filtered_boxes.cpu(),
+                iou_threshold=merge_iou_threshold
             )
-            if debug and img_id == image_ids[0]:
-                print(f"[DEBUG]   Merged {num_before_merge} predictions -> {len(binary_masks)} (IoU threshold={iou_threshold})")
 
-        if len(binary_masks) > 0:
-            mask_areas = binary_masks.flatten(1).sum(1)
+            if max_detections > 0 and len(merged_scores) > max_detections:
+                top_k_scores, top_k_indices = torch.topk(
+                    merged_scores, k=max_detections, largest=True
+                )
+                merged_scores = top_k_scores
+                merged_boxes = merged_boxes[top_k_indices]
 
-            if debug and img_id == image_ids[0]:
-                print(f"[DEBUG]   Upsampled mask shape: {binary_masks.shape}")
-                print(f"[DEBUG]   Mask areas: min={mask_areas.min():.0f}, max={mask_areas.max():.0f}, mean={mask_areas.float().mean():.0f}")
+            filtered_scores = merged_scores
+            filtered_boxes = merged_boxes
+        else:
+            _, filtered_scores, filtered_boxes = apply_sam3_nms(
+                pred_logits=logits,
+                pred_masks=masks,
+                pred_boxes=boxes,
+                prob_threshold=prob_threshold,
+                nms_iou_threshold=nms_iou_threshold,
+                max_detections=max_detections
+            )
 
-            rles = rle_encode(binary_masks)
+        if debug and img_id == image_ids[0] and len(filtered_scores) > 0:
+            print(f"[DEBUG] Image {img_id}: original size={orig_w}x{orig_h}")
+            print(
+                f"[DEBUG]   Filtered scores: min={filtered_scores.min():.4f}, "
+                f"max={filtered_scores.max():.4f}, mean={filtered_scores.mean():.4f}"
+            )
 
-            for idx, (rle, score, box) in enumerate(zip(rles, scores.cpu().tolist(), boxes.cpu().tolist())):
-                # Convert box from normalized [0,1] to original image coordinates
-                cx, cy, w_norm, h_norm = box
-                x = (cx - w_norm/2) * orig_w
-                y = (cy - h_norm/2) * orig_h
-                w = w_norm * orig_w
-                h = h_norm * orig_h
+        for idx, (score, box) in enumerate(zip(filtered_scores.cpu().tolist(), filtered_boxes.cpu().tolist())):
+            cx, cy, w_norm, h_norm = box
+            x = (cx - w_norm / 2.0) * orig_w
+            y = (cy - h_norm / 2.0) * orig_h
+            w = w_norm * orig_w
+            h = h_norm * orig_h
 
-                # Clamp coordinates to image bounds
-                x = max(0, min(x, orig_w))
-                y = max(0, min(y, orig_h))
-                w = max(0, min(w, orig_w - x))
-                h = max(0, min(h, orig_h - y))
+            x = max(0.0, min(x, float(orig_w)))
+            y = max(0.0, min(y, float(orig_h)))
+            w = max(0.0, min(w, float(orig_w) - x))
+            h = max(0.0, min(h, float(orig_h) - y))
 
-                # Skip if box is too small after clamping
-                if w < 1 or h < 1:
-                    continue
+            if w < 1 or h < 1:
+                continue
 
-                pred_dict = {
-                    'image_id': int(img_id),
-                    'category_id': int(category_id),
-                    'segmentation': rle,
-                    'bbox': [float(x), float(y), float(w), float(h)],
-                    'score': float(score),
-                    'id': pred_id
-                }
+            pred_dict = {
+                'image_id': coco_image_id,
+                'category_id': int(category_id),
+                'bbox': [float(x), float(y), float(w), float(h)],
+                'score': float(score),
+                'id': pred_id
+            }
 
-                if debug and img_id == image_ids[0] and idx == 0:
-                    print(f"[DEBUG]   First prediction bbox (at {orig_w}x{orig_h}): {pred_dict['bbox']}")
+            if debug and img_id == image_ids[0] and idx == 0:
+                print(f"[DEBUG]   First original-res bbox: {pred_dict['bbox']}")
 
-                coco_predictions.append(pred_dict)
-                pred_id += 1
+            coco_predictions.append(pred_dict)
+            pred_id += 1
 
     return coco_predictions
 
@@ -1034,11 +925,10 @@ def create_coco_gt_from_dataset_original_res(dataset, image_ids=None, debug=Fals
                 resolved_items.append((int(dataset.image_ids[candidate]), candidate))
 
     for coco_image_id, dataset_idx in resolved_items:
-        datapoint = dataset[dataset_idx]
+        image_info = dataset.images[int(coco_image_id)]
         source_annotations = dataset.img_to_anns.get(coco_image_id, [])
-
-        # Get original image size
-        orig_h, orig_w = datapoint.find_queries[0].inference_metadata.original_size
+        orig_w = int(image_info["width"])
+        orig_h = int(image_info["height"])
 
         coco_gt['images'].append({
             'id': int(coco_image_id),
@@ -1047,52 +937,20 @@ def create_coco_gt_from_dataset_original_res(dataset, image_ids=None, debug=Fals
             'is_instance_exhaustive': True
         })
 
-        for obj in datapoint.images[0].objects:
-            # Scale boxes from normalized [0,1] to original size
-            box = obj.bbox  # Already in [0,1] normalized coordinates
-            x1, y1, x2, y2 = box.tolist()
-
-            # Convert to original image coordinates
-            x1_orig = x1 * orig_w
-            y1_orig = y1 * orig_h
-            x2_orig = x2 * orig_w
-            y2_orig = y2 * orig_h
-
-            # Convert to COCO format [x, y, w, h]
-            x, y = x1_orig, y1_orig
-            w = x2_orig - x1_orig
-            h = y2_orig - y1_orig
-
-            source_ann_idx = int(getattr(obj, "object_id", -1))
-            if 0 <= source_ann_idx < len(source_annotations):
-                source_category_id = int(source_annotations[source_ann_idx].get('category_id', 1))
-            else:
-                source_category_id = 1
-
+        for source_ann in source_annotations:
+            x, y, w, h = source_ann.get('bbox', [0, 0, 0, 0])
             ann = {
                 'id': ann_id,
                 'image_id': int(coco_image_id),
-                'category_id': source_category_id,
+                'category_id': int(source_ann.get('category_id', 1)),
                 'bbox': [x, y, w, h],
                 'area': w * h,
-                'iscrowd': 0,
-                'ignore': 0
+                'iscrowd': int(source_ann.get('iscrowd', 0)),
+                'ignore': int(source_ann.get('ignore', 0))
             }
 
-            if obj.segment is not None:
-                # Upsample mask from 1008x1008 to original size
-                mask_tensor = obj.segment.unsqueeze(0).unsqueeze(0).float()
-                upsampled_mask = torch.nn.functional.interpolate(
-                    mask_tensor,
-                    size=(orig_h, orig_w),
-                    mode='bilinear',
-                    align_corners=False
-                ) > 0.5
-
-                mask_np = upsampled_mask.squeeze().cpu().numpy().astype(np.uint8)
-                rle = mask_utils.encode(np.asfortranarray(mask_np))
-                rle['counts'] = rle['counts'].decode('utf-8')
-                ann['segmentation'] = rle
+            if 'segmentation' in source_ann:
+                ann['segmentation'] = source_ann['segmentation']
 
             coco_gt['annotations'].append(ann)
             ann_id += 1
@@ -1157,12 +1015,22 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    config = None
+    # Build model
+    print("\nBuilding SAM3 model...")
+    model = build_sam3_image_model(
+        device=device.type,
+        compile=False,
+        load_from_HF=True,
+        bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
+        eval_mode=False
+    )
 
     # Load config for batch_size and other settings
     if use_base_model:
         # Use original SAM3 model without LoRA
         print("Using original SAM3 model (no LoRA)")
+        stats = count_parameters(model)
+        print(f"Total params: {stats['total_parameters']:,}")
         # Use default batch_size for base model
         batch_size = 1
     else:
@@ -1174,31 +1042,6 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         with open(config_path, "r") as f:
             config = yaml.safe_load(f)
 
-        # Get batch_size from config
-        batch_size = config["training"]["batch_size"]
-
-    model_cfg = {} if config is None else config.get("model", {})
-    srf_cfg = model_cfg.get("srf_lite", {})
-
-    # Build model
-    print("\nBuilding SAM3 model...")
-    model = build_sam3_image_model(
-        device=device.type,
-        compile=False,
-        load_from_HF=True,
-        bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
-        eval_mode=False,
-        use_srf_lite=bool(srf_cfg.get("enabled", False)),
-        srf_num_levels=int(srf_cfg.get("num_levels", 4)),
-        srf_bottleneck_dim=srf_cfg.get("bottleneck_dim", None),
-        srf_interpolation_mode=str(srf_cfg.get("interpolation_mode", "bilinear")),
-        srf_alpha_init=float(srf_cfg.get("alpha_init", 0.0)),
-    )
-
-    if use_base_model:
-        stats = count_parameters(model)
-        print(f"Total params: {stats['total_parameters']:,}")
-    else:
         # Apply LoRA
         print("Applying LoRA configuration...")
         lora_cfg = config["lora"]
@@ -1222,6 +1065,9 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
 
         stats = count_parameters(model)
         print(f"Trainable params: {stats['trainable_parameters']:,} ({stats['trainable_percentage']:.2f}%)")
+
+        # Get batch_size from config
+        batch_size = config["training"]["batch_size"]
 
     model.to(device)
     model.eval()
@@ -1333,16 +1179,12 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         "semantic_macro_F1": None,
         "semantic_micro_F1": None,
         "semantic_pixel_accuracy": None,
-        "semantic_head_mIoU": None,
-        "semantic_head_macro_F1": None,
-        "semantic_head_micro_F1": None,
-        "semantic_head_pixel_accuracy": None,
     }
 
     all_image_ids = []
     all_category_ids = []
     coco_predictions = []
-    semantic_head_prob_maps = defaultdict(dict)
+    coco_predictions_bbox = []
 
     # Use automatic mixed precision for faster inference
     use_amp = device.type == 'cuda'
@@ -1409,23 +1251,6 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
                         'pred_boxes': final_outputs['pred_boxes'][i].detach().cpu(),
                         'pred_masks': final_outputs['pred_masks'][i].detach().cpu()
                     })
-
-                    if "semantic_seg" in final_outputs:
-                        semantic_prob = (
-                            torch.sigmoid(final_outputs["semantic_seg"][i])
-                            .squeeze()
-                            .detach()
-                            .float()
-                            .cpu()
-                            .numpy()
-                        )
-                        cached_prob = semantic_head_prob_maps[img_id].get(category_id)
-                        if cached_prob is None:
-                            semantic_head_prob_maps[img_id][category_id] = semantic_prob
-                        else:
-                            semantic_head_prob_maps[img_id][category_id] = np.maximum(
-                                cached_prob, semantic_prob
-                            )
                 batch_coco_predictions = convert_predictions_to_coco_format(
                     batch_predictions,
                     batch_image_ids,
@@ -1438,10 +1263,25 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
                     merge_iou_threshold=merge_iou,
                     verbose=False,
                 )
+                batch_coco_predictions_bbox = convert_predictions_to_coco_format_original_res(
+                    batch_predictions,
+                    batch_image_ids,
+                    dataset=val_ds,
+                    category_ids=batch_category_ids,
+                    model_resolution=288,
+                    prob_threshold=prob_threshold,
+                    nms_iou_threshold=nms_iou,
+                    max_detections=100,
+                    merge_cracks=merge_cracks,
+                    merge_iou_threshold=merge_iou,
+                    debug=False,
+                )
                 coco_predictions.extend(batch_coco_predictions)
+                coco_predictions_bbox.extend(batch_coco_predictions_bbox)
 
                 # Free batch tensors early to avoid host memory accumulation
-                del batch_predictions, batch_image_ids, batch_category_ids, batch_coco_predictions
+                del batch_predictions, batch_image_ids, batch_category_ids
+                del batch_coco_predictions, batch_coco_predictions_bbox
                 del final_outputs
                 del final_stage
                 del outputs_list
@@ -1489,12 +1329,12 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
     #     print(f"[INFO] Prediction scores: min={min(all_scores):.4f}, max={max(all_scores):.4f}, mean={np.mean(all_scores):.4f}")
 
     if merge_cracks:
-        print(f"\n[INFO] Total predictions after CRACK MERGING: {len(coco_predictions)}")
+        print(f"\n[INFO] Total predictions after CRACK MERGING: {len(coco_predictions_bbox)}")
     else:
-        print(f"\n[INFO] Total predictions after SAM3 NMS filtering: {len(coco_predictions)}")
-    metrics_result["num_predictions"] = len(coco_predictions)
+        print(f"\n[INFO] Total predictions after SAM3 NMS filtering: {len(coco_predictions_bbox)}")
+    metrics_result["num_predictions"] = len(coco_predictions_bbox)
 
-    if len(coco_predictions) > 0:
+    if len(coco_predictions_bbox) > 0:
         # Save temporary files for COCO evaluation
         import tempfile
         import os
@@ -1503,11 +1343,23 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         temp_dir = tempfile.mkdtemp(prefix="sam3_eval_")
         gt_file = os.path.join(temp_dir, "gt.json")
         pred_file = os.path.join(temp_dir, "pred.json")
+        gt_bbox_file = os.path.join(temp_dir, "gt_bbox_original_res.json")
+        pred_bbox_file = os.path.join(temp_dir, "pred_bbox_original_res.json")
+
+        coco_gt_bbox_dict = create_coco_gt_from_dataset_original_res(
+            val_ds,
+            image_ids=unique_image_ids,
+            debug=False,
+        )
 
         with open(gt_file, 'w') as f:
             json.dump(coco_gt_dict, f)
         with open(pred_file, 'w') as f:
             json.dump(coco_predictions, f)
+        with open(gt_bbox_file, 'w') as f:
+            json.dump(coco_gt_bbox_dict, f)
+        with open(pred_bbox_file, 'w') as f:
+            json.dump(coco_predictions_bbox, f)
 
         # Compute mAP
         print("\n" + "="*80)
@@ -1518,9 +1370,11 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
             with contextlib.redirect_stdout(devnull):
                 coco_gt = COCO(str(gt_file))
                 coco_dt = coco_gt.loadRes(str(pred_file))
+                coco_gt_bbox = COCO(str(gt_bbox_file))
+                coco_dt_bbox = coco_gt_bbox.loadRes(str(pred_bbox_file))
 
-        print("\nBBox AP (bbox):")
-        coco_eval_bbox = run_coco_eval(coco_gt, coco_dt, 'bbox')
+        print("\nBBox AP (bbox, original resolution):")
+        coco_eval_bbox = run_coco_eval(coco_gt_bbox, coco_dt_bbox, 'bbox')
         map_bbox = coco_eval_bbox.stats[0]
         map50_bbox = coco_eval_bbox.stats[1]
         map75_bbox = coco_eval_bbox.stats[2]
@@ -1586,25 +1440,6 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
             print(f"Multi-class pixel F1 (macro): {semantic_macro_f1:.4f}")
             print(f"Multi-class pixel F1 (micro): {semantic_micro_f1:.4f}")
             print(f"Pixel accuracy: {semantic_pixel_acc:.4f}")
-
-            semantic_head_metrics = compute_multiclass_semantic_metrics_from_prob_maps(
-                coco_gt_dict=coco_gt_dict,
-                semantic_prob_maps=semantic_head_prob_maps,
-                threshold=0.5,
-            )
-            semantic_head_miou = semantic_head_metrics["semantic_mIoU"]
-            semantic_head_macro_f1 = semantic_head_metrics["semantic_macro_F1"]
-            semantic_head_micro_f1 = semantic_head_metrics["semantic_micro_F1"]
-            semantic_head_pixel_acc = semantic_head_metrics["semantic_pixel_accuracy"]
-            metrics_result["semantic_head_mIoU"] = float(semantic_head_miou)
-            metrics_result["semantic_head_macro_F1"] = float(semantic_head_macro_f1)
-            metrics_result["semantic_head_micro_F1"] = float(semantic_head_micro_f1)
-            metrics_result["semantic_head_pixel_accuracy"] = float(semantic_head_pixel_acc)
-            print("\nDirect semantic head metrics:")
-            print(f"Semantic-head mIoU: {semantic_head_miou:.4f}")
-            print(f"Semantic-head pixel F1 (macro): {semantic_head_macro_f1:.4f}")
-            print(f"Semantic-head pixel F1 (micro): {semantic_head_micro_f1:.4f}")
-            print(f"Semantic-head pixel accuracy: {semantic_head_pixel_acc:.4f}")
         else:
             print(
                 "\n[WARN] Ground truth annotations do not all contain segmentation masks "
@@ -1616,7 +1451,7 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         print("\n" + "="*80)
         print("FINAL RESULTS")
         print("="*80)
-        print(f"APbbox (IoU 0.50:0.95): {map_bbox:.4f}")
+        print(f"APbbox (IoU 0.50:0.95, original res): {map_bbox:.4f}")
         print(f"APbbox@50: {map50_bbox:.4f}")
         print(f"APbbox@75: {map75_bbox:.4f}")
         if has_full_gt_segmentation:
@@ -1630,10 +1465,6 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
             print(f"Semantic pixel F1 (macro): {semantic_macro_f1:.4f}")
             print(f"Semantic pixel F1 (micro): {semantic_micro_f1:.4f}")
             print(f"Pixel accuracy: {semantic_pixel_acc:.4f}")
-            print(f"Semantic-head mIoU: {semantic_head_miou:.4f}")
-            print(f"Semantic-head pixel F1 (macro): {semantic_head_macro_f1:.4f}")
-            print(f"Semantic-head pixel F1 (micro): {semantic_head_micro_f1:.4f}")
-            print(f"Semantic-head pixel accuracy: {semantic_head_pixel_acc:.4f}")
         else:
             print("APmask / cgF1 / semantic metrics: skipped (bbox-only or mixed GT without full segmentation)")
         print("="*80)

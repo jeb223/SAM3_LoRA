@@ -21,6 +21,10 @@ METRIC_SPECS = [
     ("semantic_macro_F1", "Semantic pixel F1 (macro)"),
     ("semantic_micro_F1", "Semantic pixel F1 (micro)"),
     ("semantic_pixel_accuracy", "Pixel accuracy"),
+    ("semantic_head_mIoU", "Semantic-head mIoU"),
+    ("semantic_head_macro_F1", "Semantic-head F1 (macro)"),
+    ("semantic_head_micro_F1", "Semantic-head F1 (micro)"),
+    ("semantic_head_pixel_accuracy", "Semantic-head accuracy"),
 ]
 
 

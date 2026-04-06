@@ -43,6 +43,8 @@ def load_lora_model(config_path, weights_path, device='cuda'):
     # Load config
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
+    model_cfg = config.get("model", {})
+    srf_cfg = model_cfg.get("srf_lite", {})
 
     # Build base model
     model = build_sam3_image_model(
@@ -50,7 +52,12 @@ def load_lora_model(config_path, weights_path, device='cuda'):
         compile=False,
         load_from_HF=True,
         bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
-        eval_mode=True
+        eval_mode=True,
+        use_srf_lite=bool(srf_cfg.get("enabled", False)),
+        srf_num_levels=int(srf_cfg.get("num_levels", 4)),
+        srf_bottleneck_dim=srf_cfg.get("bottleneck_dim", None),
+        srf_interpolation_mode=str(srf_cfg.get("interpolation_mode", "bilinear")),
+        srf_alpha_init=float(srf_cfg.get("alpha_init", 0.0)),
     )
 
     # Apply LoRA

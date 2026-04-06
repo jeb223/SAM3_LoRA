@@ -17,6 +17,13 @@ def _mark_trainable_adapter(module: nn.Module) -> nn.Module:
     return module
 
 
+def _pick_gn_groups(num_channels: int, max_groups: int = 8) -> int:
+    groups = min(max_groups, num_channels)
+    while groups > 1 and num_channels % groups != 0:
+        groups -= 1
+    return groups
+
+
 class LinearPresenceHead(nn.Sequential):
     def __init__(self, d_model):
         # a hack to make `LinearPresenceHead` compatible with old checkpoints
@@ -107,6 +114,152 @@ class MultiScaleFusionAdapter(nn.Module):
         )
         residual = self.fusion(torch.cat([curr_fpn, prev_fpn_upsampled], dim=1))
         return curr_fpn + prev_fpn_upsampled + self.residual_scale * residual
+
+
+class ConvGNAct(nn.Module):
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        kernel_size: int = 3,
+        stride: int = 1,
+        padding: int = 1,
+        act: bool = True,
+    ):
+        super().__init__()
+        layers = [
+            nn.Conv2d(
+                in_ch,
+                out_ch,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                bias=False,
+            ),
+            nn.GroupNorm(_pick_gn_groups(out_ch), out_ch),
+        ]
+        if act:
+            layers.append(nn.GELU())
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class SRFLiteFusion(nn.Module):
+    """Shallow-guided residual multi-scale fusion."""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_levels: int = 4,
+        bottleneck_dim: Optional[int] = None,
+        interpolation_mode: str = "bilinear",
+        alpha_init: float = 0.0,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_levels = num_levels
+        self.interpolation_mode = interpolation_mode
+
+        if bottleneck_dim is None:
+            bottleneck_dim = max(hidden_dim // 4, 32)
+        bottleneck_dim = min(bottleneck_dim, hidden_dim)
+        self.bottleneck_dim = bottleneck_dim
+
+        self.align_layers = nn.ModuleList(
+            [
+                ConvGNAct(
+                    hidden_dim,
+                    bottleneck_dim,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                    act=True,
+                )
+                for _ in range(num_levels)
+            ]
+        )
+
+        gate_mid = max(bottleneck_dim // 2, 8)
+        self.attn_gate = nn.Sequential(
+            nn.Conv2d(bottleneck_dim, gate_mid, kernel_size=1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(gate_mid, 1, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+
+        self.fuse = nn.Sequential(
+            ConvGNAct(
+                bottleneck_dim * num_levels,
+                hidden_dim,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                act=True,
+            ),
+            ConvGNAct(
+                hidden_dim,
+                hidden_dim,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                act=False,
+            ),
+        )
+
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+        self.out_norm = nn.GroupNorm(_pick_gn_groups(hidden_dim), hidden_dim)
+
+    @staticmethod
+    def _match_batch_dim(feats: List[torch.Tensor]) -> List[torch.Tensor]:
+        target_bs = max(feat.shape[0] for feat in feats)
+        aligned = []
+        for feat in feats:
+            if feat.shape[0] == target_bs:
+                aligned.append(feat)
+            elif feat.shape[0] == 1:
+                aligned.append(feat.expand(target_bs, -1, -1, -1))
+            else:
+                raise RuntimeError(
+                    "SRFLiteFusion got incompatible batch dimensions: "
+                    f"{[tuple(x.shape) for x in feats]}"
+                )
+        return aligned
+
+    def _resize_to(self, x: torch.Tensor, size_hw):
+        if x.shape[-2:] == size_hw:
+            return x
+        if self.interpolation_mode in ("bilinear", "bicubic", "trilinear"):
+            return F.interpolate(
+                x,
+                size=size_hw,
+                mode=self.interpolation_mode,
+                align_corners=False,
+            )
+        return F.interpolate(x, size=size_hw, mode=self.interpolation_mode)
+
+    def forward(self, feats: List[torch.Tensor]) -> torch.Tensor:
+        assert len(feats) == self.num_levels, (
+            f"Expected {self.num_levels} feature levels, got {len(feats)}"
+        )
+
+        feats = self._match_batch_dim(feats)
+        target_hw = feats[0].shape[-2:]
+        aligned = []
+        for feat, proj in zip(feats, self.align_layers):
+            x = proj(feat)
+            x = self._resize_to(x, target_hw)
+            aligned.append(x)
+
+        gate = self.attn_gate(aligned[0])
+        gated_feats = [aligned[0]]
+        for x in aligned[1:]:
+            gated_feats.append(x * gate)
+
+        fused = self.fuse(torch.cat(gated_feats, dim=1))
+        fused = self.out_norm(fused)
+        return self.alpha * fused
 
 
 class BoundaryRefinementAdapter(nn.Module):
@@ -263,6 +416,11 @@ class PixelDecoder(nn.Module):
         interpolation_mode="nearest",
         shared_conv=False,
         compile_mode=None,
+        use_srf_lite=False,
+        srf_num_levels=4,
+        srf_bottleneck_dim=None,
+        srf_interpolation_mode="bilinear",
+        srf_alpha_init=0.0,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -285,6 +443,21 @@ class PixelDecoder(nn.Module):
         )
         self.shared_conv = shared_conv
         self.out_dim = self.conv_layers[-1].out_channels
+        self.use_srf_lite = bool(use_srf_lite)
+        max_available_levels = num_upsampling_stages + 1
+        self.srf_num_levels = min(int(srf_num_levels), max_available_levels)
+        if self.use_srf_lite and self.srf_num_levels >= 2:
+            self.srf_lite = _mark_trainable_adapter(
+                SRFLiteFusion(
+                    hidden_dim=hidden_dim,
+                    num_levels=self.srf_num_levels,
+                    bottleneck_dim=srf_bottleneck_dim,
+                    interpolation_mode=srf_interpolation_mode,
+                    alpha_init=srf_alpha_init,
+                )
+            )
+        else:
+            self.srf_lite = None
         if compile_mode is not None:
             self.forward = torch.compile(
                 self.forward, mode=compile_mode, dynamic=True, fullgraph=True
@@ -297,6 +470,7 @@ class PixelDecoder(nn.Module):
 
         prev_fpn = backbone_feats[-1]
         fpn_feats = backbone_feats[:-1]
+        pyramid_feats = [prev_fpn]
         for layer_idx, bb_feat in enumerate(fpn_feats[::-1]):
             curr_fpn = bb_feat
             prev_fpn_up = F.interpolate(
@@ -308,6 +482,12 @@ class PixelDecoder(nn.Module):
                 layer_idx = 0
             prev_fpn = self.conv_layers[layer_idx](prev_fpn)
             prev_fpn = F.relu(self.norms[layer_idx](prev_fpn))
+            pyramid_feats.append(prev_fpn)
+
+        if self.srf_lite is not None and len(pyramid_feats) >= self.srf_num_levels:
+            selected_feats = list(reversed(pyramid_feats[-self.srf_num_levels:]))
+            prev_fpn = prev_fpn + self.srf_lite(selected_feats)
+            prev_fpn = F.relu(prev_fpn)
 
         return prev_fpn
 

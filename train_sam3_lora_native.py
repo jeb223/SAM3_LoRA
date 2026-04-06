@@ -25,7 +25,6 @@ import os
 import argparse
 import yaml
 import json
-import random
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
@@ -34,7 +33,7 @@ from torch.optim import AdamW
 from tqdm import tqdm
 from pathlib import Path
 import numpy as np
-from PIL import Image as PILImage, ImageEnhance, ImageFilter
+from PIL import Image as PILImage
 import contextlib
 
 # Distributed training imports
@@ -44,7 +43,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # SAM3 Imports
 from sam3.model_builder import build_sam3_image_model
 from sam3.model.model_misc import SAM3Output
-from sam3.train.loss.loss_fns import IABCEMdetr, Boxes, Masks, CORE_LOSS_KEY
+from sam3.train.loss.loss_fns import (
+    IABCEMdetr,
+    Boxes,
+    Masks,
+    SemanticSegCriterion,
+    CORE_LOSS_KEY,
+)
 from sam3.train.loss.sam3_loss import Sam3LossWrapper
 from sam3.train.matcher import BinaryHungarianMatcherV2, BinaryOneToManyMatcher
 from sam3.train.data.collator import collate_fn_api
@@ -54,7 +59,7 @@ from lora_layers import LoRAConfig, apply_lora_to_model, save_lora_weights, coun
 
 from torchvision.transforms import v2
 import pycocotools.mask as mask_utils  # Required for RLE mask decoding in COCO dataset
-from sam3.train.masks_ops import compute_boundary, rle_encode  # For encoding masks to RLE format
+from sam3.train.masks_ops import rle_encode  # For encoding masks to RLE format
 
 # Note: Evaluation modules (mAP, cgF1, NMS) are in validate_sam3_lora.py
 # Training only computes validation loss, following SAM3's approach
@@ -108,126 +113,9 @@ def print_rank0(*args, **kwargs):
         print(*args, **kwargs)
 
 
-class LowLightAugmentor:
-    """Simple low-light augmentation tailored for underground imagery."""
-
-    def __init__(self, config=None):
-        config = config or {}
-        self.enabled = bool(config.get("enabled", False))
-        self.probability = float(config.get("probability", 0.0))
-
-        self.brightness_range = self._parse_range(
-            config.get("brightness_range", [0.35, 1.0]), "brightness_range"
-        )
-        self.contrast_range = self._parse_range(
-            config.get("contrast_range", [0.7, 1.25]), "contrast_range"
-        )
-        self.gamma_range = self._parse_range(
-            config.get("gamma_range", [1.0, 2.2]), "gamma_range"
-        )
-        self.noise_std_range = self._parse_range(
-            config.get("noise_std_range", [0.0, 0.04]), "noise_std_range"
-        )
-        self.blur_radius_range = self._parse_range(
-            config.get("blur_radius_range", [0.0, 1.2]), "blur_radius_range"
-        )
-        self.flashlight_darkness_range = self._parse_range(
-            config.get("flashlight_darkness_range", [0.12, 0.4]),
-            "flashlight_darkness_range",
-        )
-        self.flashlight_gain_range = self._parse_range(
-            config.get("flashlight_gain_range", [0.7, 1.3]),
-            "flashlight_gain_range",
-        )
-        self.flashlight_sigma_range = self._parse_range(
-            config.get("flashlight_sigma_range", [0.18, 0.4]),
-            "flashlight_sigma_range",
-        )
-
-        self.flashlight_prob = float(config.get("flashlight_prob", 0.35))
-        self.grayscale_prob = float(config.get("grayscale_prob", 0.05))
-
-    @staticmethod
-    def _parse_range(value, name):
-        if value is None:
-            return None
-        if not isinstance(value, (list, tuple)) or len(value) != 2:
-            raise ValueError(f"{name} must be a list/tuple of length 2, got {value!r}")
-        lo = float(value[0])
-        hi = float(value[1])
-        if lo > hi:
-            raise ValueError(f"{name} must satisfy min <= max, got {value!r}")
-        return (lo, hi)
-
-    @staticmethod
-    def _sample(range_):
-        if range_ is None:
-            return None
-        return random.uniform(range_[0], range_[1])
-
-    def _apply_gamma(self, image_np):
-        gamma = self._sample(self.gamma_range)
-        if gamma is None or abs(gamma - 1.0) < 1e-6:
-            return image_np
-        return np.power(np.clip(image_np, 0.0, 1.0), gamma)
-
-    def _apply_flashlight(self, image_np):
-        h, w = image_np.shape[:2]
-        yy, xx = np.mgrid[0:h, 0:w]
-        cx = random.uniform(0.15, 0.85) * w
-        cy = random.uniform(0.15, 0.85) * h
-        sigma = self._sample(self.flashlight_sigma_range) * max(h, w)
-        sigma = max(sigma, 1.0)
-        darkness = self._sample(self.flashlight_darkness_range)
-        gain = self._sample(self.flashlight_gain_range)
-
-        radial = np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2.0 * sigma * sigma))
-        lighting = darkness + gain * radial
-        return image_np * np.clip(lighting[..., None], 0.05, 1.5)
-
-    def __call__(self, pil_image):
-        if not self.enabled or random.random() >= self.probability:
-            return pil_image
-
-        image = pil_image
-
-        if random.random() < self.grayscale_prob:
-            gray = np.asarray(image.convert("L"))
-            image = PILImage.fromarray(np.repeat(gray[..., None], 3, axis=2))
-
-        brightness = self._sample(self.brightness_range)
-        if brightness is not None and abs(brightness - 1.0) > 1e-6:
-            image = ImageEnhance.Brightness(image).enhance(brightness)
-
-        contrast = self._sample(self.contrast_range)
-        if contrast is not None and abs(contrast - 1.0) > 1e-6:
-            image = ImageEnhance.Contrast(image).enhance(contrast)
-
-        image_np = np.asarray(image).astype(np.float32) / 255.0
-        image_np = self._apply_gamma(image_np)
-
-        if random.random() < self.flashlight_prob:
-            image_np = self._apply_flashlight(image_np)
-
-        noise_std = self._sample(self.noise_std_range)
-        if noise_std is not None and noise_std > 0:
-            image_np = image_np + np.random.normal(
-                loc=0.0, scale=noise_std, size=image_np.shape
-            ).astype(np.float32)
-
-        image_np = np.clip(image_np, 0.0, 1.0)
-        image = PILImage.fromarray((image_np * 255.0).astype(np.uint8))
-
-        blur_radius = self._sample(self.blur_radius_range)
-        if blur_radius is not None and blur_radius > 0:
-            image = image.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-
-        return image
-
-
 class COCOSegmentDataset(Dataset):
     """Dataset class for COCO format segmentation data"""
-    def __init__(self, data_dir, split="train", low_light_augmentation=None):
+    def __init__(self, data_dir, split="train"):
         """
         Args:
             data_dir: Root directory containing train/valid/test folders
@@ -265,22 +153,11 @@ class COCOSegmentDataset(Dataset):
         print(f"  Categories: {self.categories}")
 
         self.resolution = 1008
-        self.low_light_augmentor = LowLightAugmentor(
-            low_light_augmentation if split == "train" else None
-        )
         self.transform = v2.Compose([
             v2.ToImage(),
             v2.ToDtype(torch.float32, scale=True),
             v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ])
-
-        if split == "train" and self.low_light_augmentor.enabled:
-            print(
-                "  Low-light augmentation enabled: "
-                f"p={self.low_light_augmentor.probability}, "
-                f"gamma={self.low_light_augmentor.gamma_range}, "
-                f"noise={self.low_light_augmentor.noise_std_range}"
-            )
 
     def __len__(self):
         return len(self.image_ids)
@@ -296,9 +173,6 @@ class COCOSegmentDataset(Dataset):
 
         # Resize image
         pil_image = pil_image.resize((self.resolution, self.resolution), PILImage.BILINEAR)
-
-        if self.split == "train":
-            pil_image = self.low_light_augmentor(pil_image)
 
         # Transform to tensor
         image_tensor = self.transform(pil_image)
@@ -913,12 +787,19 @@ class SAM3TrainerNative:
 
         # Build Model
         print_rank0("Building SAM3 model...")
+        model_cfg = self.config.get("model", {})
+        srf_cfg = model_cfg.get("srf_lite", {})
         self.model = build_sam3_image_model(
             device=self.device.type,
             compile=False,
             load_from_HF=True,  # Tries to download from HF if checkpoint_path is None
             bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
-            eval_mode=False
+            eval_mode=False,
+            use_srf_lite=bool(srf_cfg.get("enabled", False)),
+            srf_num_levels=int(srf_cfg.get("num_levels", 4)),
+            srf_bottleneck_dim=srf_cfg.get("bottleneck_dim", None),
+            srf_interpolation_mode=str(srf_cfg.get("interpolation_mode", "bilinear")),
+            srf_alpha_init=float(srf_cfg.get("alpha_init", 0.0)),
         )
 
         # Apply LoRA
@@ -981,21 +862,40 @@ class SAM3TrainerNative:
             enabled=self.device.type == "cuda" and mixed_precision == "fp16"
         )
 
-        boundary_cfg = train_cfg.get("boundary_optimization", {})
-        self.boundary_enabled = bool(boundary_cfg.get("enabled", True))
-        self.boundary_loss_weight = float(boundary_cfg.get("loss_weight", 20.0))
-        self.boundary_dice_weight = float(boundary_cfg.get("dice_weight", 5.0))
-
         print_rank0(
             f"Mixed precision: {mixed_precision} "
             f"(enabled={self.amp_enabled}, dtype={self.amp_dtype})"
         )
         print_rank0(f"Gradient accumulation steps: {self.grad_accum_steps}")
+
+        semantic_cfg = train_cfg.get("semantic_optimization", {})
+        self.semantic_enabled = bool(semantic_cfg.get("enabled", False))
+        self.semantic_loss_fn = None
+        if self.semantic_enabled:
+            semantic_weight_dict = {
+                "loss_semantic_seg": float(semantic_cfg.get("loss_weight", 20.0)),
+                "loss_semantic_dice": float(semantic_cfg.get("dice_weight", 30.0)),
+            }
+            if bool(semantic_cfg.get("presence_head", True)):
+                semantic_weight_dict["loss_semantic_presence"] = float(
+                    semantic_cfg.get("presence_weight", 1.0)
+                )
+
+            self.semantic_loss_fn = SemanticSegCriterion(
+                weight_dict=semantic_weight_dict,
+                focal=bool(semantic_cfg.get("focal", True)),
+                focal_alpha=float(semantic_cfg.get("focal_alpha", 0.6)),
+                focal_gamma=float(semantic_cfg.get("focal_gamma", 2.0)),
+                downsample=bool(semantic_cfg.get("downsample", False)),
+                presence_head=bool(semantic_cfg.get("presence_head", True)),
+                presence_loss=bool(semantic_cfg.get("presence_loss", False)),
+            )
+
         print_rank0(
-            "Boundary optimization: "
-            f"enabled={self.boundary_enabled}, "
-            f"loss_weight={self.boundary_loss_weight}, "
-            f"dice_weight={self.boundary_dice_weight}"
+            "Semantic optimization: "
+            f"enabled={self.semantic_enabled}, "
+            f"loss_weight={semantic_cfg.get('loss_weight', 20.0)}, "
+            f"dice_weight={semantic_cfg.get('dice_weight', 30.0)}"
         )
         
         # Matcher & Loss
@@ -1043,6 +943,7 @@ class SAM3TrainerNative:
         # Use Sam3LossWrapper for proper loss computation
         self.loss_wrapper = Sam3LossWrapper(
             loss_fns_find=loss_fns,
+            loss_fn_semantic_seg=self.semantic_loss_fn,
             matcher=self.matcher,
             o2m_matcher=o2m_matcher,
             o2m_weight=2.0,
@@ -1050,90 +951,6 @@ class SAM3TrainerNative:
             normalization="local",  # Use local normalization (no distributed training)
             normalize_by_valid_object_num=False,
         )
-
-    @staticmethod
-    def _compute_boundary_dice_loss(logits, targets):
-        probs = logits.sigmoid()
-        probs = probs.flatten(1)
-        targets = targets.flatten(1)
-        intersection = 2.0 * (probs * targets).sum(dim=1)
-        denominator = probs.sum(dim=1) + targets.sum(dim=1)
-        return 1.0 - ((intersection + 1.0) / (denominator + 1.0)).mean()
-
-    def _build_query_boundary_targets(self, stage_targets, device):
-        if stage_targets["masks"] is None:
-            return None
-
-        masks = stage_targets["masks"].to(device=device, dtype=torch.bool)
-        is_valid_mask = stage_targets["is_valid_mask"].to(device=device, dtype=torch.bool)
-        num_boxes = stage_targets["num_boxes"].tolist()
-
-        query_boundaries = []
-        start = 0
-        height, width = masks.shape[-2:]
-        for count in num_boxes:
-            end = start + int(count)
-            if count == 0:
-                semantic_mask = torch.zeros((height, width), device=device, dtype=torch.bool)
-            else:
-                valid_masks = masks[start:end][is_valid_mask[start:end]]
-                if valid_masks.numel() == 0:
-                    semantic_mask = torch.zeros((height, width), device=device, dtype=torch.bool)
-                else:
-                    semantic_mask = valid_masks.any(dim=0)
-            query_boundaries.append(compute_boundary(semantic_mask).float())
-            start = end
-
-        if not query_boundaries:
-            return None
-
-        return torch.stack(query_boundaries, dim=0).unsqueeze(1)
-
-    def _compute_boundary_loss(self, outputs_list, find_targets):
-        if not self.boundary_enabled:
-            return torch.tensor(0.0, device=self.device)
-
-        total_boundary_loss = torch.tensor(0.0, device=self.device)
-        num_terms = 0
-
-        with SAM3Output.iteration_mode(
-            outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
-        ) as outputs_iter:
-            for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
-                final_outputs = stage_outputs[-1]
-                if "pred_boundaries" not in final_outputs:
-                    continue
-
-                target_boundaries = self._build_query_boundary_targets(
-                    stage_targets, device=final_outputs["pred_boundaries"].device
-                )
-                if target_boundaries is None:
-                    continue
-
-                pred_boundaries = final_outputs["pred_boundaries"]
-                if pred_boundaries.dtype == torch.bfloat16:
-                    pred_boundaries = pred_boundaries.float()
-                if pred_boundaries.shape[-2:] != target_boundaries.shape[-2:]:
-                    pred_boundaries = torch.nn.functional.interpolate(
-                        pred_boundaries,
-                        size=target_boundaries.shape[-2:],
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-
-                bce = torch.nn.functional.binary_cross_entropy_with_logits(
-                    pred_boundaries, target_boundaries
-                )
-                dice = self._compute_boundary_dice_loss(pred_boundaries, target_boundaries)
-                total_boundary_loss = total_boundary_loss + (
-                    self.boundary_loss_weight * bce
-                    + self.boundary_dice_weight * dice
-                )
-                num_terms += 1
-
-        if num_terms == 0:
-            return torch.tensor(0.0, device=self.device)
-        return total_boundary_loss / num_terms
         
     def train(self):
         # Get data directory from config (should point to directory containing train/valid folders)
@@ -1141,12 +958,7 @@ class SAM3TrainerNative:
 
         # Load datasets using COCO format
         print_rank0(f"\nLoading training data from {data_dir}...")
-        low_light_aug_cfg = self.config["training"].get("low_light_augmentation", {})
-        train_ds = COCOSegmentDataset(
-            data_dir=data_dir,
-            split="train",
-            low_light_augmentation=low_light_aug_cfg,
-        )
+        train_ds = COCOSegmentDataset(data_dir=data_dir, split="train")
 
         # Check if validation data exists
         has_validation = False
@@ -1332,10 +1144,8 @@ class SAM3TrainerNative:
                         # This handles num_boxes calculation and proper weighting
                         loss_dict = self.loss_wrapper(outputs_list, find_targets)
 
-                        boundary_loss = self._compute_boundary_loss(outputs_list, find_targets)
-
                         # Extract total loss
-                        total_loss = loss_dict[CORE_LOSS_KEY] + boundary_loss
+                        total_loss = loss_dict[CORE_LOSS_KEY]
                         loss_for_backward = total_loss / self.grad_accum_steps
 
                     # Backward (scaled for gradient accumulation)
@@ -1363,10 +1173,7 @@ class SAM3TrainerNative:
 
                 # Track training loss
                 train_losses.append(total_loss.item())
-                pbar.set_postfix({
-                    "loss": total_loss.item(),
-                    "boundary": float(boundary_loss.item()) if self.boundary_enabled else 0.0,
-                })
+                pbar.set_postfix({"loss": total_loss.item()})
 
             # Calculate average training loss for this epoch
             avg_train_loss = sum(train_losses) / len(train_losses) if train_losses else 0.0
@@ -1410,8 +1217,7 @@ class SAM3TrainerNative:
 
                         # Compute loss using Sam3LossWrapper
                         loss_dict = self.loss_wrapper(outputs_list, find_targets)
-                        boundary_loss = self._compute_boundary_loss(outputs_list, find_targets)
-                        total_loss = loss_dict[CORE_LOSS_KEY] + boundary_loss
+                        total_loss = loss_dict[CORE_LOSS_KEY]
 
                         val_losses.append(total_loss.item())
                         val_pbar.set_postfix({"val_loss": total_loss.item()})
