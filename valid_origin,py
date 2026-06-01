@@ -1015,14 +1015,44 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    # Load config before model construction so optional model modules
+    # such as SRF-Lite are present before adaptation weights are loaded.
+    config = None
+    if use_base_model:
+        batch_size = 1
+    else:
+        if config_path is None or weights_path is None:
+            raise ValueError("config_path and weights_path are required when use_base_model=False")
+
+        with open(config_path, "r") as f:
+            config = yaml.safe_load(f)
+        batch_size = config["training"]["batch_size"]
+
+    model_cfg = {} if config is None else config.get("model", {})
+    srf_cfg = model_cfg.get("srf_lite", {})
+    use_srf_lite = bool(srf_cfg.get("enabled", False))
+
     # Build model
     print("\nBuilding SAM3 model...")
+    if use_srf_lite:
+        print(
+            "Using SRF-Lite: "
+            f"num_levels={int(srf_cfg.get('num_levels', 4))}, "
+            f"bottleneck_dim={srf_cfg.get('bottleneck_dim', None)}, "
+            f"interpolation={str(srf_cfg.get('interpolation_mode', 'bilinear'))}, "
+            f"alpha_init={float(srf_cfg.get('alpha_init', 0.0))}"
+        )
     model = build_sam3_image_model(
         device=device.type,
         compile=False,
         load_from_HF=True,
         bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
-        eval_mode=False
+        eval_mode=False,
+        use_srf_lite=use_srf_lite,
+        srf_num_levels=int(srf_cfg.get("num_levels", 4)),
+        srf_bottleneck_dim=srf_cfg.get("bottleneck_dim", None),
+        srf_interpolation_mode=str(srf_cfg.get("interpolation_mode", "bilinear")),
+        srf_alpha_init=float(srf_cfg.get("alpha_init", 0.0)),
     )
 
     # Load config for batch_size and other settings
@@ -1031,16 +1061,8 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         print("Using original SAM3 model (no LoRA)")
         stats = count_parameters(model)
         print(f"Total params: {stats['total_parameters']:,}")
-        # Use default batch_size for base model
-        batch_size = 1
     else:
         # Apply LoRA and load weights
-        if config_path is None or weights_path is None:
-            raise ValueError("config_path and weights_path are required when use_base_model=False")
-
-        # Load config
-        with open(config_path, "r") as f:
-            config = yaml.safe_load(f)
 
         # Apply LoRA
         print("Applying LoRA configuration...")
@@ -1065,9 +1087,6 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
 
         stats = count_parameters(model)
         print(f"Trainable params: {stats['trainable_parameters']:,} ({stats['trainable_percentage']:.2f}%)")
-
-        # Get batch_size from config
-        batch_size = config["training"]["batch_size"]
 
     model.to(device)
     model.eval()

@@ -858,26 +858,32 @@ def run_coco_eval(coco_gt, coco_dt, iou_type):
     return coco_eval
 
 
-def convert_predictions_to_coco_format_original_res(predictions_list, image_ids, dataset, model_resolution=288, score_threshold=0.0, merge_overlaps=True, iou_threshold=0.3, debug=False, category_ids=None):
+def convert_predictions_to_coco_format_original_res(predictions_list, image_ids, dataset,
+                                                    model_resolution=288,
+                                                    prob_threshold=0.3,
+                                                    nms_iou_threshold=0.7,
+                                                    max_detections=100,
+                                                    merge_cracks=False,
+                                                    merge_iou_threshold=0.15,
+                                                    debug=False,
+                                                    category_ids=None):
     """
     Convert model predictions to COCO format at ORIGINAL image resolution.
 
-    This matches the inference approach (infer_sam.py) where:
-    1. Masks are upsampled from 288x288 to original image size
-    2. Boxes are scaled to original image size
-    3. Evaluation happens at original resolution
-
     Args:
         predictions_list: List of predictions per query-item
-        image_ids: List of image IDs (indices into dataset)
-        dataset: Dataset to get original image sizes
+        image_ids: List of COCO image IDs aligned with predictions_list
+        dataset: Dataset that provides original image sizes via dataset.images
         category_ids: List of COCO category IDs aligned with predictions_list
         model_resolution: Model output resolution (default: 288)
-        score_threshold: Confidence threshold
-        merge_overlaps: Whether to merge overlapping predictions
-        iou_threshold: IoU threshold for merging
+        prob_threshold: Confidence threshold for filtering predictions
+        nms_iou_threshold: NMS IoU threshold
+        max_detections: Maximum detections per image
+        merge_cracks: Whether to merge overlapping predictions instead of NMS
+        merge_iou_threshold: IoU threshold for merging
         debug: Print debug info
     """
+    del model_resolution
     if category_ids is None:
         category_ids = [1] * len(predictions_list)
     if len(category_ids) != len(predictions_list):
@@ -887,103 +893,110 @@ def convert_predictions_to_coco_format_original_res(predictions_list, image_ids,
 
     coco_predictions = []
     pred_id = 0
+    coco_id_to_image = {int(coco_id): img for coco_id, img in dataset.images.items()}
 
     if debug:
         print(f"\n[DEBUG] Converting {len(predictions_list)} predictions to COCO format (ORIGINAL RESOLUTION)...")
-        if merge_overlaps:
-            print(f"[DEBUG] Overlapping segment merging ENABLED (IoU threshold={iou_threshold})")
+        if merge_cracks:
+            print(f"[DEBUG] Overlapping segment merging ENABLED (IoU threshold={merge_iou_threshold})")
 
     for img_id, preds, category_id in zip(image_ids, predictions_list, category_ids):
         if preds is None or len(preds.get('pred_logits', [])) == 0:
             continue
 
-        # Get original image size from dataset
-        datapoint = dataset[img_id]
-        orig_h, orig_w = datapoint.find_queries[0].inference_metadata.original_size
+        coco_image_id = int(img_id)
+        image_info = coco_id_to_image.get(coco_image_id)
+        if image_info is None:
+            if debug:
+                print(f"[DEBUG] Skipping unknown COCO image id: {coco_image_id}")
+            continue
+        orig_w = int(image_info["width"])
+        orig_h = int(image_info["height"])
 
         logits = preds['pred_logits']
         boxes = preds['pred_boxes']
-        masks = preds['pred_masks']  # [N, 288, 288]
+        masks = preds['pred_masks']  # [N, H, W]
 
-        scores = torch.sigmoid(logits).squeeze(-1)
+        if merge_cracks:
+            pred_probs = torch.sigmoid(logits).squeeze(-1)
+            valid_mask = pred_probs > prob_threshold
+            filtered_masks = masks[valid_mask]
+            filtered_scores = pred_probs[valid_mask]
+            filtered_boxes = boxes[valid_mask]
 
-        # Filter by score threshold
-        valid_mask = scores > score_threshold
-        num_before = len(scores)
-        scores = scores[valid_mask]
-        boxes = boxes[valid_mask]
-        masks = masks[valid_mask]
+            if len(filtered_masks) == 0:
+                continue
 
-        if debug and img_id == image_ids[0]:
-            print(f"[DEBUG] Image {img_id}: {num_before} queries -> {len(scores)} after filtering (threshold={score_threshold})")
-            if len(scores) > 0:
-                print(f"[DEBUG]   Original size: {orig_w}x{orig_h}")
-                print(f"[DEBUG]   Filtered scores: min={scores.min():.4f}, max={scores.max():.4f}, mean={scores.mean():.4f}")
+            pred_masks_sigmoid = torch.sigmoid(filtered_masks)
+            masks_upsampled = torch.nn.functional.interpolate(
+                pred_masks_sigmoid.unsqueeze(1).float(),
+                size=(orig_h, orig_w),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(1)
+            pred_masks_binary = masks_upsampled > 0.5
 
-        if len(masks) == 0:
-            continue
-
-        # Upsample masks from 288x288 to original resolution (like infer_sam.py)
-        masks_sigmoid = torch.sigmoid(masks)  # [N, 288, 288]
-        masks_upsampled = torch.nn.functional.interpolate(
-            masks_sigmoid.unsqueeze(1).float(),  # [N, 1, 288, 288]
-            size=(orig_h, orig_w),
-            mode='bilinear',
-            align_corners=False
-        ).squeeze(1)  # [N, orig_h, orig_w]
-
-        binary_masks = (masks_upsampled > 0.5).cpu()
-
-        # Merge overlapping predictions
-        if merge_overlaps and len(binary_masks) > 0:
-            num_before_merge = len(binary_masks)
-            binary_masks, scores, boxes = merge_overlapping_masks(
-                binary_masks, scores.cpu(), boxes.cpu(), iou_threshold=iou_threshold
+            merged_masks, merged_scores, merged_boxes = merge_overlapping_masks(
+                pred_masks_binary.cpu(),
+                filtered_scores.cpu(),
+                filtered_boxes.cpu(),
+                iou_threshold=merge_iou_threshold
             )
-            if debug and img_id == image_ids[0]:
-                print(f"[DEBUG]   Merged {num_before_merge} predictions -> {len(binary_masks)} (IoU threshold={iou_threshold})")
 
-        if len(binary_masks) > 0:
-            mask_areas = binary_masks.flatten(1).sum(1)
+            if max_detections > 0 and len(merged_scores) > max_detections:
+                top_k_scores, top_k_indices = torch.topk(
+                    merged_scores, k=max_detections, largest=True
+                )
+                merged_scores = top_k_scores
+                merged_boxes = merged_boxes[top_k_indices]
 
-            if debug and img_id == image_ids[0]:
-                print(f"[DEBUG]   Upsampled mask shape: {binary_masks.shape}")
-                print(f"[DEBUG]   Mask areas: min={mask_areas.min():.0f}, max={mask_areas.max():.0f}, mean={mask_areas.float().mean():.0f}")
+            filtered_scores = merged_scores
+            filtered_boxes = merged_boxes
+        else:
+            _, filtered_scores, filtered_boxes = apply_sam3_nms(
+                pred_logits=logits,
+                pred_masks=masks,
+                pred_boxes=boxes,
+                prob_threshold=prob_threshold,
+                nms_iou_threshold=nms_iou_threshold,
+                max_detections=max_detections
+            )
 
-            rles = rle_encode(binary_masks)
+        if debug and img_id == image_ids[0] and len(filtered_scores) > 0:
+            print(f"[DEBUG] Image {img_id}: original size={orig_w}x{orig_h}")
+            print(
+                f"[DEBUG]   Filtered scores: min={filtered_scores.min():.4f}, "
+                f"max={filtered_scores.max():.4f}, mean={filtered_scores.mean():.4f}"
+            )
 
-            for idx, (rle, score, box) in enumerate(zip(rles, scores.cpu().tolist(), boxes.cpu().tolist())):
-                # Convert box from normalized [0,1] to original image coordinates
-                cx, cy, w_norm, h_norm = box
-                x = (cx - w_norm/2) * orig_w
-                y = (cy - h_norm/2) * orig_h
-                w = w_norm * orig_w
-                h = h_norm * orig_h
+        for idx, (score, box) in enumerate(zip(filtered_scores.cpu().tolist(), filtered_boxes.cpu().tolist())):
+            cx, cy, w_norm, h_norm = box
+            x = (cx - w_norm / 2.0) * orig_w
+            y = (cy - h_norm / 2.0) * orig_h
+            w = w_norm * orig_w
+            h = h_norm * orig_h
 
-                # Clamp coordinates to image bounds
-                x = max(0, min(x, orig_w))
-                y = max(0, min(y, orig_h))
-                w = max(0, min(w, orig_w - x))
-                h = max(0, min(h, orig_h - y))
+            x = max(0.0, min(x, float(orig_w)))
+            y = max(0.0, min(y, float(orig_h)))
+            w = max(0.0, min(w, float(orig_w) - x))
+            h = max(0.0, min(h, float(orig_h) - y))
 
-                # Skip if box is too small after clamping
-                if w < 1 or h < 1:
-                    continue
+            if w < 1 or h < 1:
+                continue
 
-                pred_dict = {
-                    'image_id': int(img_id),
-                    'category_id': int(category_id),
-                    'segmentation': rle,
-                    'bbox': [float(x), float(y), float(w), float(h)],
-                    'score': float(score),
-                    'id': pred_id
-                }
+            pred_dict = {
+                'image_id': coco_image_id,
+                'category_id': int(category_id),
+                'bbox': [float(x), float(y), float(w), float(h)],
+                'score': float(score),
+                'id': pred_id
+            }
 
-                if debug and img_id == image_ids[0] and idx == 0:
-                    print(f"[DEBUG]   First prediction bbox (at {orig_w}x{orig_h}): {pred_dict['bbox']}")
+            if debug and img_id == image_ids[0] and idx == 0:
+                print(f"[DEBUG]   First original-res bbox: {pred_dict['bbox']}")
 
-                coco_predictions.append(pred_dict)
-                pred_id += 1
+            coco_predictions.append(pred_dict)
+            pred_id += 1
 
     return coco_predictions
 
@@ -1034,11 +1047,16 @@ def create_coco_gt_from_dataset_original_res(dataset, image_ids=None, debug=Fals
                 resolved_items.append((int(dataset.image_ids[candidate]), candidate))
 
     for coco_image_id, dataset_idx in resolved_items:
-        datapoint = dataset[dataset_idx]
-        source_annotations = dataset.img_to_anns.get(coco_image_id, [])
-
-        # Get original image size
-        orig_h, orig_w = datapoint.find_queries[0].inference_metadata.original_size
+        del dataset_idx
+        image_info = dataset.images.get(int(coco_image_id), dataset.images.get(str(coco_image_id)))
+        if image_info is None:
+            continue
+        source_annotations = dataset.img_to_anns.get(
+            int(coco_image_id),
+            dataset.img_to_anns.get(str(coco_image_id), []),
+        )
+        orig_w = int(image_info["width"])
+        orig_h = int(image_info["height"])
 
         coco_gt['images'].append({
             'id': int(coco_image_id),
@@ -1047,52 +1065,20 @@ def create_coco_gt_from_dataset_original_res(dataset, image_ids=None, debug=Fals
             'is_instance_exhaustive': True
         })
 
-        for obj in datapoint.images[0].objects:
-            # Scale boxes from normalized [0,1] to original size
-            box = obj.bbox  # Already in [0,1] normalized coordinates
-            x1, y1, x2, y2 = box.tolist()
-
-            # Convert to original image coordinates
-            x1_orig = x1 * orig_w
-            y1_orig = y1 * orig_h
-            x2_orig = x2 * orig_w
-            y2_orig = y2 * orig_h
-
-            # Convert to COCO format [x, y, w, h]
-            x, y = x1_orig, y1_orig
-            w = x2_orig - x1_orig
-            h = y2_orig - y1_orig
-
-            source_ann_idx = int(getattr(obj, "object_id", -1))
-            if 0 <= source_ann_idx < len(source_annotations):
-                source_category_id = int(source_annotations[source_ann_idx].get('category_id', 1))
-            else:
-                source_category_id = 1
-
+        for source_ann in source_annotations:
+            x, y, w, h = source_ann.get('bbox', [0, 0, 0, 0])
             ann = {
                 'id': ann_id,
                 'image_id': int(coco_image_id),
-                'category_id': source_category_id,
+                'category_id': int(source_ann.get('category_id', 1)),
                 'bbox': [x, y, w, h],
                 'area': w * h,
-                'iscrowd': 0,
-                'ignore': 0
+                'iscrowd': int(source_ann.get('iscrowd', 0)),
+                'ignore': int(source_ann.get('ignore', 0))
             }
 
-            if obj.segment is not None:
-                # Upsample mask from 1008x1008 to original size
-                mask_tensor = obj.segment.unsqueeze(0).unsqueeze(0).float()
-                upsampled_mask = torch.nn.functional.interpolate(
-                    mask_tensor,
-                    size=(orig_h, orig_w),
-                    mode='bilinear',
-                    align_corners=False
-                ) > 0.5
-
-                mask_np = upsampled_mask.squeeze().cpu().numpy().astype(np.uint8)
-                rle = mask_utils.encode(np.asfortranarray(mask_np))
-                rle['counts'] = rle['counts'].decode('utf-8')
-                ann['segmentation'] = rle
+            if 'segmentation' in source_ann:
+                ann['segmentation'] = source_ann['segmentation']
 
             coco_gt['annotations'].append(ann)
             ann_id += 1
@@ -1316,6 +1302,8 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         "num_unique_images": 0,
         "num_unique_categories": 0,
         "num_predictions": 0,
+        "num_predictions_288": 0,
+        "num_predictions_original_res": 0,
         "has_gt_segmentation": None,
         "mAP": None,
         "mAP50": None,
@@ -1326,6 +1314,12 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         "APbbox": None,
         "APbbox50": None,
         "APbbox75": None,
+        "APbbox_288": None,
+        "APbbox50_288": None,
+        "APbbox75_288": None,
+        "APbbox_original_res": None,
+        "APbbox50_original_res": None,
+        "APbbox75_original_res": None,
         "cgF1": None,
         "cgF1_50": None,
         "cgF1_75": None,
@@ -1342,6 +1336,7 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
     all_image_ids = []
     all_category_ids = []
     coco_predictions = []
+    coco_predictions_bbox = []
     semantic_head_prob_maps = defaultdict(dict)
 
     # Use automatic mixed precision for faster inference
@@ -1438,10 +1433,25 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
                     merge_iou_threshold=merge_iou,
                     verbose=False,
                 )
+                batch_coco_predictions_bbox = convert_predictions_to_coco_format_original_res(
+                    batch_predictions,
+                    batch_image_ids,
+                    dataset=val_ds,
+                    category_ids=batch_category_ids,
+                    model_resolution=288,
+                    prob_threshold=prob_threshold,
+                    nms_iou_threshold=nms_iou,
+                    max_detections=100,
+                    merge_cracks=merge_cracks,
+                    merge_iou_threshold=merge_iou,
+                    debug=False,
+                )
                 coco_predictions.extend(batch_coco_predictions)
+                coco_predictions_bbox.extend(batch_coco_predictions_bbox)
 
                 # Free batch tensors early to avoid host memory accumulation
-                del batch_predictions, batch_image_ids, batch_category_ids, batch_coco_predictions
+                del batch_predictions, batch_image_ids, batch_category_ids
+                del batch_coco_predictions, batch_coco_predictions_bbox
                 del final_outputs
                 del final_stage
                 del outputs_list
@@ -1489,10 +1499,14 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
     #     print(f"[INFO] Prediction scores: min={min(all_scores):.4f}, max={max(all_scores):.4f}, mean={np.mean(all_scores):.4f}")
 
     if merge_cracks:
-        print(f"\n[INFO] Total predictions after CRACK MERGING: {len(coco_predictions)}")
+        print(f"\n[INFO] Total predictions after CRACK MERGING (288 eval): {len(coco_predictions)}")
+        print(f"[INFO] Total predictions after CRACK MERGING (original-res bbox eval): {len(coco_predictions_bbox)}")
     else:
-        print(f"\n[INFO] Total predictions after SAM3 NMS filtering: {len(coco_predictions)}")
-    metrics_result["num_predictions"] = len(coco_predictions)
+        print(f"\n[INFO] Total predictions after SAM3 NMS filtering (288 eval): {len(coco_predictions)}")
+        print(f"[INFO] Total predictions after SAM3 NMS filtering (original-res bbox eval): {len(coco_predictions_bbox)}")
+    metrics_result["num_predictions"] = len(coco_predictions_bbox)
+    metrics_result["num_predictions_288"] = len(coco_predictions)
+    metrics_result["num_predictions_original_res"] = len(coco_predictions_bbox)
 
     if len(coco_predictions) > 0:
         # Save temporary files for COCO evaluation
@@ -1503,11 +1517,23 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         temp_dir = tempfile.mkdtemp(prefix="sam3_eval_")
         gt_file = os.path.join(temp_dir, "gt.json")
         pred_file = os.path.join(temp_dir, "pred.json")
+        gt_bbox_file = os.path.join(temp_dir, "gt_bbox_original_res.json")
+        pred_bbox_file = os.path.join(temp_dir, "pred_bbox_original_res.json")
+
+        coco_gt_bbox_dict = create_coco_gt_from_dataset_original_res(
+            val_ds,
+            image_ids=unique_image_ids,
+            debug=False,
+        )
 
         with open(gt_file, 'w') as f:
             json.dump(coco_gt_dict, f)
         with open(pred_file, 'w') as f:
             json.dump(coco_predictions, f)
+        with open(gt_bbox_file, 'w') as f:
+            json.dump(coco_gt_bbox_dict, f)
+        with open(pred_bbox_file, 'w') as f:
+            json.dump(coco_predictions_bbox, f)
 
         # Compute mAP
         print("\n" + "="*80)
@@ -1518,12 +1544,39 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
             with contextlib.redirect_stdout(devnull):
                 coco_gt = COCO(str(gt_file))
                 coco_dt = coco_gt.loadRes(str(pred_file))
+                coco_gt_bbox = COCO(str(gt_bbox_file))
+                coco_dt_bbox = (
+                    coco_gt_bbox.loadRes(str(pred_bbox_file))
+                    if len(coco_predictions_bbox) > 0
+                    else None
+                )
 
-        print("\nBBox AP (bbox):")
+        print("\nBBox AP (bbox, 288 resolution):")
         coco_eval_bbox = run_coco_eval(coco_gt, coco_dt, 'bbox')
-        map_bbox = coco_eval_bbox.stats[0]
-        map50_bbox = coco_eval_bbox.stats[1]
-        map75_bbox = coco_eval_bbox.stats[2]
+        map_bbox_288 = coco_eval_bbox.stats[0]
+        map50_bbox_288 = coco_eval_bbox.stats[1]
+        map75_bbox_288 = coco_eval_bbox.stats[2]
+        metrics_result["APbbox_288"] = float(map_bbox_288)
+        metrics_result["APbbox50_288"] = float(map50_bbox_288)
+        metrics_result["APbbox75_288"] = float(map75_bbox_288)
+
+        map_bbox = map_bbox_288
+        map50_bbox = map50_bbox_288
+        map75_bbox = map75_bbox_288
+        has_original_bbox_eval = False
+        if coco_dt_bbox is not None:
+            print("\nBBox AP (bbox, original resolution):")
+            coco_eval_bbox_original = run_coco_eval(coco_gt_bbox, coco_dt_bbox, 'bbox')
+            map_bbox = coco_eval_bbox_original.stats[0]
+            map50_bbox = coco_eval_bbox_original.stats[1]
+            map75_bbox = coco_eval_bbox_original.stats[2]
+            has_original_bbox_eval = True
+            metrics_result["APbbox_original_res"] = float(map_bbox)
+            metrics_result["APbbox50_original_res"] = float(map50_bbox)
+            metrics_result["APbbox75_original_res"] = float(map75_bbox)
+        else:
+            print("\n[WARN] No original-res bbox predictions generated; APbbox uses 288-resolution fallback.")
+
         metrics_result["APbbox"] = float(map_bbox)
         metrics_result["APbbox50"] = float(map50_bbox)
         metrics_result["APbbox75"] = float(map75_bbox)
@@ -1616,9 +1669,15 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         print("\n" + "="*80)
         print("FINAL RESULTS")
         print("="*80)
-        print(f"APbbox (IoU 0.50:0.95): {map_bbox:.4f}")
-        print(f"APbbox@50: {map50_bbox:.4f}")
-        print(f"APbbox@75: {map75_bbox:.4f}")
+        if has_original_bbox_eval:
+            print(f"APbbox (IoU 0.50:0.95, original res): {map_bbox:.4f}")
+            print(f"APbbox@50 (original res): {map50_bbox:.4f}")
+            print(f"APbbox@75 (original res): {map75_bbox:.4f}")
+        else:
+            print("APbbox original-res: skipped (no original-res bbox predictions)")
+        print(f"APbbox (IoU 0.50:0.95, 288 eval): {map_bbox_288:.4f}")
+        print(f"APbbox@50 (288 eval): {map50_bbox_288:.4f}")
+        print(f"APbbox@75 (288 eval): {map75_bbox_288:.4f}")
         if has_full_gt_segmentation:
             print(f"APmask (IoU 0.50:0.95): {map_segm:.4f}")
             print(f"APmask@50: {map50_segm:.4f}")

@@ -34,6 +34,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import yaml
 from torchvision.ops import nms
+from sam3.perflib.nms import nms_masks
 
 # SAM3 imports
 from sam3.model_builder import build_sam3_image_model
@@ -62,11 +63,12 @@ class SAM3LoRAInference:
 
     def __init__(
         self,
-        config_path: str,
+        config_path: Optional[str] = None,
         weights_path: Optional[str] = None,
         resolution: int = 1008,
         detection_threshold: float = 0.5,
         nms_iou_threshold: float = 0.5,
+        use_base_model: bool = False,
         gamma_preprocess: float = 1.0,
         use_clahe: bool = False,
         clahe_clip_limit: float = 2.0,
@@ -87,17 +89,25 @@ class SAM3LoRAInference:
             use_clahe: Whether to apply CLAHE before inference.
             device: Device to run on (default: "cuda")
         """
-        # Load config
-        with open(config_path, 'r') as f:
-            self.config = yaml.safe_load(f)
+        self.use_base_model = use_base_model
+        if not use_base_model and config_path is None:
+            raise ValueError("--config is required unless --use-base-model is set")
+
+        # Load config when available. Base SAM3 inference intentionally ignores
+        # trained adapters such as LoRA and SRF-Lite.
+        if config_path is not None:
+            with open(config_path, 'r') as f:
+                self.config = yaml.safe_load(f)
+        else:
+            self.config = {}
 
         # Auto-detect weights if not provided
-        if weights_path is None:
+        if not use_base_model and weights_path is None:
             output_dir = self.config.get('output', {}).get('output_dir', 'outputs/sam3_lora_full')
             weights_path = os.path.join(output_dir, 'best_lora_weights.pt')
             print(f"鈩癸笍  Auto-detected weights: {weights_path}")
 
-        if not os.path.exists(weights_path):
+        if not use_base_model and not os.path.exists(weights_path):
             raise FileNotFoundError(f"LoRA weights not found: {weights_path}")
 
         self.weights_path = weights_path
@@ -110,7 +120,8 @@ class SAM3LoRAInference:
         self.clahe_tile_grid_size = clahe_tile_grid_size
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
 
-        print(f"馃敡 Initializing SAM3 + LoRA...")
+        model_name = "base SAM3" if use_base_model else "SAM3 + LoRA"
+        print(f"馃敡 Initializing {model_name}...")
         print(f"   Device: {self.device}")
         print(f"   Resolution: {resolution}x{resolution}")
         print(f"   Confidence threshold: {detection_threshold}")
@@ -125,7 +136,7 @@ class SAM3LoRAInference:
 
         # Build base model
         print("\n馃摝 Building SAM3 model...")
-        model_cfg = self.config.get("model", {})
+        model_cfg = {} if use_base_model else self.config.get("model", {})
         srf_cfg = model_cfg.get("srf_lite", {})
         self.model = build_sam3_image_model(
             device=self.device.type,
@@ -140,26 +151,29 @@ class SAM3LoRAInference:
             srf_alpha_init=float(srf_cfg.get("alpha_init", 0.0)),
         )
 
-        # Apply LoRA configuration
-        print("馃敆 Applying LoRA configuration...")
-        lora_cfg = self.config["lora"]
-        lora_config = LoRAConfig(
-            rank=lora_cfg["rank"],
-            alpha=lora_cfg["alpha"],
-            dropout=0.0,  # No dropout during inference
-            target_modules=lora_cfg["target_modules"],
-            apply_to_vision_encoder=lora_cfg["apply_to_vision_encoder"],
-            apply_to_text_encoder=lora_cfg["apply_to_text_encoder"],
-            apply_to_geometry_encoder=lora_cfg["apply_to_geometry_encoder"],
-            apply_to_detr_encoder=lora_cfg["apply_to_detr_encoder"],
-            apply_to_detr_decoder=lora_cfg["apply_to_detr_decoder"],
-            apply_to_mask_decoder=lora_cfg["apply_to_mask_decoder"],
-        )
-        self.model = apply_lora_to_model(self.model, lora_config)
+        if use_base_model:
+            print("Using original SAM3 model without LoRA weights.")
+        else:
+            # Apply LoRA configuration
+            print("馃敆 Applying LoRA configuration...")
+            lora_cfg = self.config["lora"]
+            lora_config = LoRAConfig(
+                rank=lora_cfg["rank"],
+                alpha=lora_cfg["alpha"],
+                dropout=0.0,  # No dropout during inference
+                target_modules=lora_cfg["target_modules"],
+                apply_to_vision_encoder=lora_cfg["apply_to_vision_encoder"],
+                apply_to_text_encoder=lora_cfg["apply_to_text_encoder"],
+                apply_to_geometry_encoder=lora_cfg["apply_to_geometry_encoder"],
+                apply_to_detr_encoder=lora_cfg["apply_to_detr_encoder"],
+                apply_to_detr_decoder=lora_cfg["apply_to_detr_decoder"],
+                apply_to_mask_decoder=lora_cfg["apply_to_mask_decoder"],
+            )
+            self.model = apply_lora_to_model(self.model, lora_config)
 
-        # Load LoRA weights
-        print(f"馃捑 Loading LoRA weights from {weights_path}...")
-        load_lora_weights(self.model, weights_path)
+            # Load LoRA weights
+            print(f"馃捑 Loading LoRA weights from {weights_path}...")
+            load_lora_weights(self.model, weights_path)
 
         self.model.to(self.device)
         self.model.eval()
@@ -183,7 +197,7 @@ class SAM3LoRAInference:
         # because PostProcessImage may have additional filtering logic
         self.use_manual_postprocess = True
 
-        print("鉁?SAM3 + LoRA ready for inference!\n")
+        print(f"鉁?{model_name} ready for inference!\n")
 
     def _apply_gamma_preprocess(self, pil_image: PILImage.Image) -> PILImage.Image:
         if abs(self.gamma_preprocess - 1.0) < 1e-6:
@@ -340,9 +354,22 @@ class SAM3LoRAInference:
             num_keep = keep.sum().item()
 
             if num_keep > 0:
-                # Get boxes and convert from cxcywh to xyxy
+                # Get boxes and masks selected by score.
                 boxes_cxcywh = pred_boxes[0, keep]  # [num_keep, 4]
                 kept_scores = scores[keep]
+                kept_masks = pred_masks[0, keep] if pred_masks is not None else None
+
+                if kept_masks is not None and len(kept_scores) > 0:
+                    nms_keep_mask = nms_masks(
+                        pred_probs=kept_scores,
+                        pred_masks=(kept_masks.sigmoid() > 0.5).float(),
+                        prob_threshold=0.0,
+                        iou_threshold=self.nms_iou_threshold,
+                    )
+                    boxes_cxcywh = boxes_cxcywh[nms_keep_mask]
+                    kept_scores = kept_scores[nms_keep_mask]
+                    kept_masks = kept_masks[nms_keep_mask]
+
                 cx, cy, w, h = boxes_cxcywh.unbind(-1)
 
                 # Convert to xyxy and scale to original image size
@@ -354,21 +381,18 @@ class SAM3LoRAInference:
 
                 boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=-1)
 
-                # Apply NMS to remove overlapping boxes
-                keep_nms = nms(boxes_xyxy, kept_scores, self.nms_iou_threshold)
-                boxes_xyxy = boxes_xyxy[keep_nms]
-                kept_scores = kept_scores[keep_nms]
-                num_keep = len(keep_nms)
+                if kept_masks is None and len(kept_scores) > 0:
+                    keep_nms = nms(boxes_xyxy, kept_scores, self.nms_iou_threshold)
+                    boxes_xyxy = boxes_xyxy[keep_nms]
+                    kept_scores = kept_scores[keep_nms]
+                num_keep = len(kept_scores)
 
                 # Get masks and resize to original size
-                if pred_masks is not None:
-                    # Apply NMS filtering to masks too
-                    masks_small = pred_masks[0, keep][keep_nms].sigmoid() > 0.5  # [num_keep_nms, H, W]
-
-                    # Resize masks to original image size
+                if kept_masks is not None:
+                    # Resize sigmoid probabilities, then threshold at original size.
                     import torch.nn.functional as F
                     masks_resized = F.interpolate(
-                        masks_small.unsqueeze(0).float(),
+                        kept_masks.sigmoid().unsqueeze(0).float(),
                         size=(orig_h, orig_w),
                         mode='bilinear',
                         align_corners=False
@@ -516,14 +540,19 @@ def main():
     parser.add_argument(
         "--config",
         type=str,
-        required=True,
-        help="Path to training config YAML"
+        default=None,
+        help="Path to training config YAML. Required unless --use-base-model is set."
     )
     parser.add_argument(
         "--weights",
         type=str,
         default=None,
         help="Path to LoRA weights (auto-detected if not provided)"
+    )
+    parser.add_argument(
+        "--use-base-model",
+        action="store_true",
+        help="Run original SAM3 without applying or loading LoRA weights"
     )
     parser.add_argument(
         "--image",
@@ -606,6 +635,7 @@ def main():
         resolution=args.resolution,
         detection_threshold=args.threshold,
         nms_iou_threshold=args.nms_iou,
+        use_base_model=args.use_base_model,
         gamma_preprocess=args.gamma_preprocess,
         use_clahe=args.clahe,
         clahe_clip_limit=args.clahe_clip_limit,
