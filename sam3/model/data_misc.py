@@ -163,6 +163,7 @@ class BatchedDatapoint:
     find_inputs: List[FindStage]
     find_targets: List[BatchedFindTarget]
     find_metadatas: List[BatchedInferenceMetadata]
+    depth_batch: Optional[torch.Tensor] = None
     raw_images: Optional[List[Any]] = None
 
 

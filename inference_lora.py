@@ -49,6 +49,10 @@ class SAM3LoRAInference:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.weights_path = weights_path
         self.resolution = 1008
+        model_cfg = self.config.get("model", {})
+        srf_cfg = model_cfg.get("srf_lite", {})
+        self.depth_cfg = model_cfg.get("depth_guidance", {})
+        self.depth_enabled = bool(self.depth_cfg.get("enabled", False))
 
         # Build Model
         print("Building SAM3 model...")
@@ -57,7 +61,26 @@ class SAM3LoRAInference:
             compile=False,
             load_from_HF=True,
             bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
-            eval_mode=True  # Set to eval mode for inference
+            eval_mode=True,  # Set to eval mode for inference
+            use_srf_lite=bool(srf_cfg.get("enabled", False)),
+            srf_num_levels=int(srf_cfg.get("num_levels", 4)),
+            srf_bottleneck_dim=srf_cfg.get("bottleneck_dim", None),
+            srf_interpolation_mode=str(srf_cfg.get("interpolation_mode", "bilinear")),
+            srf_alpha_init=float(srf_cfg.get("alpha_init", 0.0)),
+            use_depth_guidance=self.depth_enabled,
+            depth_input_channels=int(self.depth_cfg.get("input_channels", 3)),
+            depth_encoder_dim=int(self.depth_cfg.get("encoder_dim", 64)),
+            depth_alpha_init=float(self.depth_cfg.get("alpha_init", 0.1)),
+            use_depth_boundary=bool(self.depth_cfg.get("use_depth_boundary", True)),
+            depth_boundary_alpha_init=float(
+                self.depth_cfg.get("boundary_alpha_init", 0.0)
+            ),
+            use_depth_semantic_fusion=bool(
+                self.depth_cfg.get("use_semantic_fusion", True)
+            ),
+            depth_semantic_alpha_init=float(
+                self.depth_cfg.get("semantic_alpha_init", 0.0)
+            ),
         )
 
         # Apply LoRA (with same config as training)
@@ -93,7 +116,51 @@ class SAM3LoRAInference:
 
         print("✅ Model ready for inference!")
 
-    def prepare_image(self, image_path):
+    def _load_depth_tensor(self, depth_path):
+        if depth_path is None:
+            return torch.zeros(
+                (3, self.resolution, self.resolution),
+                dtype=torch.float32,
+            )
+
+        depth_img = PILImage.open(depth_path)
+        depth_img = depth_img.resize(
+            (self.resolution, self.resolution),
+            PILImage.NEAREST,
+        )
+        depth_np = np.asarray(depth_img)
+        if depth_np.ndim == 3:
+            depth_np = depth_np.astype(np.float32).mean(axis=-1)
+        else:
+            depth_np = depth_np.astype(np.float32)
+
+        valid = np.isfinite(depth_np) & (depth_np > 0)
+        depth_norm = np.zeros_like(depth_np, dtype=np.float32)
+        if valid.any():
+            valid_depth = depth_np[valid]
+            low, high = np.percentile(valid_depth, [1, 99])
+            if high <= low:
+                low = float(valid_depth.min())
+                high = float(valid_depth.max())
+            depth_norm = np.clip(
+                (depth_np - low) / max(float(high - low), 1e-6),
+                0.0,
+                1.0,
+            ).astype(np.float32)
+            depth_norm[~valid] = 0.0
+
+        grad_y, grad_x = np.gradient(depth_norm)
+        depth_edge = np.sqrt(grad_x * grad_x + grad_y * grad_y).astype(np.float32)
+        edge_max = float(depth_edge.max())
+        if edge_max > 1e-6:
+            depth_edge = depth_edge / edge_max
+        depth_edge[~valid] = 0.0
+        depth_valid = valid.astype(np.float32)
+        return torch.from_numpy(
+            np.stack([depth_norm, depth_edge, depth_valid], axis=0)
+        ).float()
+
+    def prepare_image(self, image_path, depth_path=None):
         """
         Load and prepare image for inference.
 
@@ -112,12 +179,16 @@ class SAM3LoRAInference:
 
         # Transform to tensor
         image_tensor = self.transform(pil_image_resized)
+        depth_tensor = None
+        if self.depth_enabled:
+            depth_tensor = self._load_depth_tensor(depth_path)
 
         # Create Image object
         image_obj = Image(
             data=image_tensor,
             objects=[],  # No objects for inference
-            size=(self.resolution, self.resolution)
+            size=(self.resolution, self.resolution),
+            depth=depth_tensor,
         )
 
         # Create query
@@ -144,7 +215,7 @@ class SAM3LoRAInference:
         ), pil_image, (orig_w, orig_h)
 
     @torch.no_grad()
-    def predict(self, image_path, text_prompt=None):
+    def predict(self, image_path, text_prompt=None, depth_path=None):
         """
         Run inference on an image with optional text prompt.
 
@@ -162,7 +233,10 @@ class SAM3LoRAInference:
                 - image: PIL Image object
         """
         # Prepare input
-        datapoint, original_image, (orig_w, orig_h) = self.prepare_image(image_path)
+        datapoint, original_image, (orig_w, orig_h) = self.prepare_image(
+            image_path,
+            depth_path=depth_path,
+        )
 
         # Override text prompt if provided
         if text_prompt:
@@ -373,6 +447,12 @@ def main():
         help="Path to input image"
     )
     parser.add_argument(
+        "--depth",
+        type=str,
+        default=None,
+        help="Optional depth map path for DGS-SAM3 inference"
+    )
+    parser.add_argument(
         "--prompt",
         type=str,
         default=None,
@@ -421,11 +501,15 @@ def main():
         print(f"❌ Image file not found: {args.image}")
         return
 
+    if args.depth is not None and not os.path.exists(args.depth):
+        print(f"Depth file not found: {args.depth}")
+        return
+
     # Initialize inference
     inferencer = SAM3LoRAInference(args.config, args.weights)
 
     # Run prediction
-    predictions = inferencer.predict(args.image, args.prompt)
+    predictions = inferencer.predict(args.image, args.prompt, depth_path=args.depth)
 
     # Visualize results with NMS
     inferencer.visualize_predictions(predictions, args.output, args.threshold, text_prompt=args.prompt, nms_iou_threshold=args.nms_iou)

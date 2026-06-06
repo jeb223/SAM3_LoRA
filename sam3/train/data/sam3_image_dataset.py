@@ -119,6 +119,10 @@ class Image:
     objects: List[Object]
     size: Tuple[int, int]  # (height, width)
 
+    # Optional depth guidance tensor. DGS-SAM3 expects three channels:
+    # normalized depth, depth edge, and valid-depth mask.
+    depth: Optional[torch.Tensor] = None
+
     # For blurring augmentation
     blurring_mask: Optional[Dict[str, Any]] = None
 

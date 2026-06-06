@@ -208,8 +208,19 @@ def _create_segmentation_head(
     srf_bottleneck_dim=None,
     srf_interpolation_mode="bilinear",
     srf_alpha_init=0.0,
+    use_depth_guidance=False,
+    depth_input_channels=3,
+    depth_encoder_dim=64,
+    depth_alpha_init=0.1,
+    use_depth_boundary=True,
+    depth_boundary_alpha_init=0.0,
+    use_depth_semantic_fusion=True,
+    depth_semantic_alpha_init=0.0,
 ):
     """Create segmentation head with pixel decoder."""
+    depth_context_enabled = bool(
+        use_depth_guidance and use_srf_lite and int(srf_num_levels) >= 2
+    )
     pixel_decoder = PixelDecoder(
         num_upsampling_stages=3,
         interpolation_mode="nearest",
@@ -220,6 +231,10 @@ def _create_segmentation_head(
         srf_bottleneck_dim=srf_bottleneck_dim,
         srf_interpolation_mode=srf_interpolation_mode,
         srf_alpha_init=srf_alpha_init,
+        use_depth_guidance=depth_context_enabled,
+        depth_input_channels=depth_input_channels,
+        depth_encoder_dim=depth_encoder_dim,
+        depth_alpha_init=depth_alpha_init,
     )
 
     cross_attend_prompt = MultiheadAttention(
@@ -237,6 +252,10 @@ def _create_segmentation_head(
         act_ckpt=True,
         cross_attend_prompt=cross_attend_prompt,
         pixel_decoder=pixel_decoder,
+        use_depth_boundary=depth_context_enabled and use_depth_boundary,
+        depth_boundary_alpha_init=depth_boundary_alpha_init,
+        use_depth_semantic_fusion=depth_context_enabled and use_depth_semantic_fusion,
+        depth_semantic_alpha_init=depth_semantic_alpha_init,
     )
     return segmentation_head
 
@@ -580,6 +599,14 @@ def build_sam3_image_model(
     srf_bottleneck_dim=None,
     srf_interpolation_mode="bilinear",
     srf_alpha_init=0.0,
+    use_depth_guidance=False,
+    depth_input_channels=3,
+    depth_encoder_dim=64,
+    depth_alpha_init=0.1,
+    use_depth_boundary=True,
+    depth_boundary_alpha_init=0.0,
+    use_depth_semantic_fusion=True,
+    depth_semantic_alpha_init=0.0,
 ):
     """
     Build SAM3 image model
@@ -627,6 +654,14 @@ def build_sam3_image_model(
             srf_bottleneck_dim=srf_bottleneck_dim,
             srf_interpolation_mode=srf_interpolation_mode,
             srf_alpha_init=srf_alpha_init,
+            use_depth_guidance=use_depth_guidance,
+            depth_input_channels=depth_input_channels,
+            depth_encoder_dim=depth_encoder_dim,
+            depth_alpha_init=depth_alpha_init,
+            use_depth_boundary=use_depth_boundary,
+            depth_boundary_alpha_init=depth_boundary_alpha_init,
+            use_depth_semantic_fusion=use_depth_semantic_fusion,
+            depth_semantic_alpha_init=depth_semantic_alpha_init,
         )
         if enable_segmentation
         else None

@@ -143,6 +143,8 @@ def collate_fn_api(
 ):
     # img_batch = torch.stack(sum([[img.data for img in v.images] for v in batch], []))
     img_batch = []
+    depth_batch = []
+    has_depth = False
     text_batch = []
     raw_images = None
 
@@ -194,7 +196,10 @@ def collate_fn_api(
     offset_img_id = 0
     offset_query_id = [0 for _ in range(num_stages)]
     for i, data in enumerate(batch):
-        img_batch.extend([img.data for img in data.images])
+        for img in data.images:
+            img_batch.append(img.data)
+            depth_batch.append(img.depth)
+            has_depth = has_depth or img.depth is not None
 
         if data.raw_images is not None:
             if raw_images is None:
@@ -348,6 +353,26 @@ def collate_fn_api(
         # long videos with thousands of frames (where image tensors could be several GBs)
         image_batch = image_batch.half()
 
+    depth_tensor_batch = None
+    if has_depth:
+        normalized_depth = []
+        for img, depth in zip(img_batch, depth_batch):
+            if depth is None:
+                depth = img.new_zeros((3, *img.shape[-2:]))
+            elif depth.ndim == 2:
+                depth = depth.unsqueeze(0)
+            elif depth.ndim != 3:
+                raise ValueError(
+                    f"Depth tensors must have shape [C,H,W] or [H,W], got {tuple(depth.shape)}"
+                )
+            if depth.shape[0] == 1:
+                depth = depth.expand(3, -1, -1)
+            assert (
+                depth.shape[-2:] == img.shape[-2:]
+            ), "Depth and RGB tensors must have the same spatial size"
+            normalized_depth.append(depth.float())
+        depth_tensor_batch = torch.stack(normalized_depth)
+
     return {
         dict_key: BatchedDatapoint(
             img_batch=image_batch,
@@ -355,6 +380,7 @@ def collate_fn_api(
             find_inputs=stages,
             find_targets=find_targets,
             find_metadatas=find_metadatas,
+            depth_batch=depth_tensor_batch,
             raw_images=raw_images,
         )
     }

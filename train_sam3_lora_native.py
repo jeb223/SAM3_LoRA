@@ -27,6 +27,7 @@ import yaml
 import json
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
@@ -49,6 +50,7 @@ from sam3.train.loss.loss_fns import (
     Masks,
     SemanticSegCriterion,
     CORE_LOSS_KEY,
+    instance_masks_to_semantic_masks,
 )
 from sam3.train.loss.sam3_loss import Sam3LossWrapper
 from sam3.train.matcher import BinaryHungarianMatcherV2, BinaryOneToManyMatcher
@@ -115,15 +117,25 @@ def print_rank0(*args, **kwargs):
 
 class COCOSegmentDataset(Dataset):
     """Dataset class for COCO format segmentation data"""
-    def __init__(self, data_dir, split="train"):
+    def __init__(self, data_dir, split="train", depth_cfg=None):
         """
         Args:
             data_dir: Root directory containing train/valid/test folders
             split: One of 'train', 'valid', 'test'
+            depth_cfg: Optional DGS-SAM3 depth guidance configuration
         """
         self.data_dir = Path(data_dir)
         self.split = split
         self.split_dir = self.data_dir / split
+        self.depth_cfg = depth_cfg or {}
+        self.depth_enabled = bool(self.depth_cfg.get("enabled", False))
+        self.depth_dir = self.depth_cfg.get("depth_dir", "depth")
+        self.depth_extensions = self.depth_cfg.get(
+            "depth_extensions", [".png", ".jpg", ".jpeg", ".tif", ".tiff"]
+        )
+        self.depth_missing_policy = str(
+            self.depth_cfg.get("missing_policy", "zeros")
+        ).lower()
 
         # Load COCO annotations
         ann_file = self.split_dir / "_annotations.coco.json"
@@ -151,6 +163,11 @@ class COCOSegmentDataset(Dataset):
         print(f"  Images: {len(self.image_ids)}")
         print(f"  Annotations: {len(self.coco_data['annotations'])}")
         print(f"  Categories: {self.categories}")
+        if self.depth_enabled:
+            print(
+                "  Depth guidance: enabled "
+                f"(depth_dir={self.depth_dir}, missing_policy={self.depth_missing_policy})"
+            )
 
         self.resolution = 1008
         self.transform = v2.Compose([
@@ -161,6 +178,81 @@ class COCOSegmentDataset(Dataset):
 
     def __len__(self):
         return len(self.image_ids)
+
+    def _resolve_depth_path(self, img_info, img_path: Path):
+        if not self.depth_enabled:
+            return None
+
+        candidates = []
+        for key in ("depth_file_name", "depth_path", "depth", "depth_name"):
+            value = img_info.get(key, None)
+            if value:
+                value_path = Path(value)
+                if value_path.is_absolute():
+                    candidates.append(value_path)
+                else:
+                    candidates.append(self.split_dir / value_path)
+                    candidates.append(self.data_dir / value_path)
+
+        file_name_path = Path(img_info["file_name"])
+        stem_path = file_name_path.with_suffix("")
+        depth_dir = Path(self.depth_dir)
+        depth_roots = [depth_dir] if depth_dir.is_absolute() else [
+            self.split_dir / depth_dir,
+            self.data_dir / depth_dir / self.split,
+            self.data_dir / depth_dir,
+        ]
+        for root in depth_roots:
+            for ext in self.depth_extensions:
+                candidates.append(root / file_name_path.with_suffix(ext))
+                candidates.append(root / f"{stem_path.name}{ext}")
+                candidates.append(root / f"{stem_path.name}_depth{ext}")
+                candidates.append(img_path.with_name(f"{stem_path.name}_depth{ext}"))
+
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+
+        if self.depth_missing_policy == "error":
+            raise FileNotFoundError(
+                f"Depth map not found for image {img_info['file_name']}"
+            )
+        return None
+
+    def _load_depth_tensor(self, depth_path, size_hw):
+        if depth_path is None:
+            return torch.zeros((3, *size_hw), dtype=torch.float32)
+
+        depth_img = PILImage.open(depth_path)
+        depth_img = depth_img.resize((size_hw[1], size_hw[0]), PILImage.NEAREST)
+        depth_np = np.asarray(depth_img)
+        if depth_np.ndim == 3:
+            depth_np = depth_np.astype(np.float32).mean(axis=-1)
+        else:
+            depth_np = depth_np.astype(np.float32)
+
+        valid = np.isfinite(depth_np) & (depth_np > 0)
+        depth_norm = np.zeros_like(depth_np, dtype=np.float32)
+        if valid.any():
+            valid_depth = depth_np[valid]
+            low, high = np.percentile(valid_depth, [1, 99])
+            if high <= low:
+                low = float(valid_depth.min())
+                high = float(valid_depth.max())
+            denom = max(float(high - low), 1e-6)
+            depth_norm = np.clip((depth_np - low) / denom, 0.0, 1.0).astype(np.float32)
+            depth_norm[~valid] = 0.0
+
+        grad_y, grad_x = np.gradient(depth_norm)
+        depth_edge = np.sqrt(grad_x * grad_x + grad_y * grad_y).astype(np.float32)
+        edge_max = float(depth_edge.max())
+        if edge_max > 1e-6:
+            depth_edge = depth_edge / edge_max
+        depth_edge[~valid] = 0.0
+
+        depth_valid = valid.astype(np.float32)
+        depth_tensor = np.stack([depth_norm, depth_edge, depth_valid], axis=0)
+        return torch.from_numpy(depth_tensor).float()
 
     def __getitem__(self, idx):
         img_id = self.image_ids[idx]
@@ -176,6 +268,13 @@ class COCOSegmentDataset(Dataset):
 
         # Transform to tensor
         image_tensor = self.transform(pil_image)
+        depth_tensor = None
+        if self.depth_enabled:
+            depth_path = self._resolve_depth_path(img_info, img_path)
+            depth_tensor = self._load_depth_tensor(
+                depth_path,
+                (self.resolution, self.resolution),
+            )
 
         # Get annotations for this image
         annotations = self.img_to_anns.get(img_id, [])
@@ -257,7 +356,8 @@ class COCOSegmentDataset(Dataset):
         image_obj = Image(
             data=image_tensor,
             objects=objects,
-            size=(self.resolution, self.resolution)
+            size=(self.resolution, self.resolution),
+            depth=depth_tensor,
         )
 
         # Construct Queries - one per unique category
@@ -789,6 +889,8 @@ class SAM3TrainerNative:
         print_rank0("Building SAM3 model...")
         model_cfg = self.config.get("model", {})
         srf_cfg = model_cfg.get("srf_lite", {})
+        depth_cfg = model_cfg.get("depth_guidance", {})
+        self.depth_enabled = bool(depth_cfg.get("enabled", False))
         self.model = build_sam3_image_model(
             device=self.device.type,
             compile=False,
@@ -800,6 +902,20 @@ class SAM3TrainerNative:
             srf_bottleneck_dim=srf_cfg.get("bottleneck_dim", None),
             srf_interpolation_mode=str(srf_cfg.get("interpolation_mode", "bilinear")),
             srf_alpha_init=float(srf_cfg.get("alpha_init", 0.0)),
+            use_depth_guidance=self.depth_enabled,
+            depth_input_channels=int(depth_cfg.get("input_channels", 3)),
+            depth_encoder_dim=int(depth_cfg.get("encoder_dim", 64)),
+            depth_alpha_init=float(depth_cfg.get("alpha_init", 0.1)),
+            use_depth_boundary=bool(depth_cfg.get("use_depth_boundary", True)),
+            depth_boundary_alpha_init=float(
+                depth_cfg.get("boundary_alpha_init", 0.0)
+            ),
+            use_depth_semantic_fusion=bool(
+                depth_cfg.get("use_semantic_fusion", True)
+            ),
+            depth_semantic_alpha_init=float(
+                depth_cfg.get("semantic_alpha_init", 0.0)
+            ),
         )
 
         # Apply LoRA
@@ -897,6 +1013,27 @@ class SAM3TrainerNative:
             f"loss_weight={semantic_cfg.get('loss_weight', 20.0)}, "
             f"dice_weight={semantic_cfg.get('dice_weight', 30.0)}"
         )
+
+        depth_loss_cfg = train_cfg.get("depth_optimization", {})
+        self.depth_loss_enabled = self.depth_enabled and bool(
+            depth_loss_cfg.get("enabled", True)
+        )
+        self.depth_boundary_loss_weight = float(
+            depth_loss_cfg.get("boundary_weight", 1.0)
+        )
+        self.depth_sem_boundary_loss_weight = float(
+            depth_loss_cfg.get("semantic_boundary_weight", 1.0)
+        )
+        self.depth_edge_loss_weight = float(
+            depth_loss_cfg.get("edge_weight", 2.0)
+        )
+        print_rank0(
+            "Depth guidance: "
+            f"enabled={self.depth_enabled}, "
+            f"aux_loss={self.depth_loss_enabled}, "
+            f"boundary_weight={self.depth_boundary_loss_weight}, "
+            f"semantic_boundary_weight={self.depth_sem_boundary_loss_weight}"
+        )
         
         # Matcher & Loss
         self.matcher = BinaryHungarianMatcherV2(
@@ -951,14 +1088,204 @@ class SAM3TrainerNative:
             normalization="local",  # Use local normalization (no distributed training)
             normalize_by_valid_object_num=False,
         )
+
+    @staticmethod
+    def _binary_mask_boundary(mask: torch.Tensor) -> torch.Tensor:
+        """Convert [B,1,H,W] binary masks into a thin boundary target."""
+        mask = (mask > 0.5).float()
+        dilated = F.max_pool2d(mask, kernel_size=3, stride=1, padding=1)
+        eroded = 1.0 - F.max_pool2d(1.0 - mask, kernel_size=3, stride=1, padding=1)
+        return (dilated - eroded).clamp(min=0.0, max=1.0)
+
+    @staticmethod
+    def _ensure_batched_logits(logits: torch.Tensor) -> torch.Tensor:
+        if logits.ndim == 3:
+            return logits.unsqueeze(0)
+        return logits
+
+    @staticmethod
+    def _match_logits_to_target_batch(logits: torch.Tensor, target: torch.Tensor):
+        if logits.shape[0] == target.shape[0]:
+            return logits, target
+        if logits.shape[0] == 1:
+            return logits.expand(target.shape[0], -1, -1, -1), target
+        if target.shape[0] == 1:
+            return logits, target.expand(logits.shape[0], -1, -1, -1)
+        raise RuntimeError(
+            "DGS auxiliary loss got incompatible batch dimensions: "
+            f"{tuple(logits.shape)} vs {tuple(target.shape)}"
+        )
+
+    def _select_stage_depth_edges(
+        self,
+        input_batch,
+        stage_idx: int,
+        batch_size: int,
+        target_hw,
+        device,
+    ):
+        depth_batch = getattr(input_batch, "depth_batch", None)
+        if depth_batch is None:
+            return None
+
+        depth_edges = depth_batch[:, 1:2].to(device)
+        img_ids = input_batch.find_inputs[stage_idx].img_ids.to(depth_edges.device)
+        if img_ids.numel() == batch_size:
+            selected_edges = depth_edges[img_ids, ...]
+        elif depth_edges.shape[0] == batch_size:
+            selected_edges = depth_edges
+        else:
+            selected_edges = depth_edges[img_ids, ...]
+
+        if selected_edges.shape[-2:] != target_hw:
+            selected_edges = F.interpolate(
+                selected_edges,
+                size=target_hw,
+                mode="bilinear",
+                align_corners=False,
+            )
+        return selected_edges.clamp(0.0, 1.0)
+
+    def _semantic_target_from_instances(
+        self,
+        targets,
+        target_hw,
+        device,
+    ):
+        masks = targets.get("masks", None)
+        if masks is None:
+            return None
+        num_boxes = targets["num_boxes"].to(device)
+        masks = masks.to(device).bool()
+        semantic_target = instance_masks_to_semantic_masks(masks, num_boxes).float()
+        if semantic_target.ndim == 3:
+            semantic_target = semantic_target.unsqueeze(1)
+        if semantic_target.shape[-2:] != target_hw:
+            semantic_target = F.interpolate(
+                semantic_target,
+                size=target_hw,
+                mode="nearest",
+            )
+        return semantic_target
+
+    def _compute_depth_aux_losses(self, outputs_list, find_targets, input_batch):
+        if not self.depth_loss_enabled or getattr(input_batch, "depth_batch", None) is None:
+            return {}
+
+        total_boundary = input_batch.img_batch.new_tensor(0.0)
+        total_sem_boundary = input_batch.img_batch.new_tensor(0.0)
+        boundary_count = 0
+        sem_boundary_count = 0
+
+        with SAM3Output.iteration_mode(
+            outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
+        ) as outputs_iter:
+            for stage_idx, (stage_outputs, targets) in enumerate(
+                zip(outputs_iter, find_targets)
+            ):
+                for outputs in stage_outputs:
+                    pred_boundaries = outputs.get("pred_boundaries", None)
+                    if pred_boundaries is not None:
+                        pred_boundaries = self._ensure_batched_logits(pred_boundaries)
+                        target_hw = pred_boundaries.shape[-2:]
+                        semantic_target = self._semantic_target_from_instances(
+                            targets,
+                            target_hw,
+                            pred_boundaries.device,
+                        )
+                        if semantic_target is not None:
+                            pred_boundaries, semantic_target = (
+                                self._match_logits_to_target_batch(
+                                    pred_boundaries,
+                                    semantic_target,
+                                )
+                            )
+                            boundary_target = self._binary_mask_boundary(
+                                semantic_target
+                            )
+                            depth_edges = self._select_stage_depth_edges(
+                                input_batch,
+                                stage_idx,
+                                pred_boundaries.shape[0],
+                                target_hw,
+                                pred_boundaries.device,
+                            )
+                            weight = 1.0
+                            if depth_edges is not None:
+                                weight = 1.0 + self.depth_edge_loss_weight * depth_edges
+                            total_boundary = total_boundary + F.binary_cross_entropy_with_logits(
+                                pred_boundaries,
+                                boundary_target,
+                                weight=weight,
+                            )
+                            boundary_count += 1
+
+                    semantic_logits = outputs.get("semantic_seg", None)
+                    if semantic_logits is not None:
+                        semantic_logits = self._ensure_batched_logits(semantic_logits)
+                        target_hw = semantic_logits.shape[-2:]
+                        semantic_target = self._semantic_target_from_instances(
+                            targets,
+                            target_hw,
+                            semantic_logits.device,
+                        )
+                        if semantic_target is not None:
+                            semantic_logits, semantic_target = (
+                                self._match_logits_to_target_batch(
+                                    semantic_logits,
+                                    semantic_target,
+                                )
+                            )
+                            boundary_target = self._binary_mask_boundary(
+                                semantic_target
+                            )
+                            depth_edges = self._select_stage_depth_edges(
+                                input_batch,
+                                stage_idx,
+                                semantic_logits.shape[0],
+                                target_hw,
+                                semantic_logits.device,
+                            )
+                            weight = 1.0 + boundary_target
+                            if depth_edges is not None:
+                                weight = weight + self.depth_edge_loss_weight * depth_edges
+                            total_sem_boundary = total_sem_boundary + F.binary_cross_entropy_with_logits(
+                                semantic_logits,
+                                semantic_target,
+                                weight=weight,
+                            )
+                            sem_boundary_count += 1
+
+        losses = {}
+        core_loss = input_batch.img_batch.new_tensor(0.0)
+        if boundary_count > 0:
+            loss_depth_boundary = (
+                total_boundary / boundary_count
+            ) * self.depth_boundary_loss_weight
+            losses["loss_depth_boundary"] = loss_depth_boundary
+            core_loss = core_loss + loss_depth_boundary
+        if sem_boundary_count > 0:
+            loss_depth_sem_boundary = (
+                total_sem_boundary / sem_boundary_count
+            ) * self.depth_sem_boundary_loss_weight
+            losses["loss_depth_sem_boundary"] = loss_depth_sem_boundary
+            core_loss = core_loss + loss_depth_sem_boundary
+        if losses:
+            losses[CORE_LOSS_KEY] = core_loss
+        return losses
         
     def train(self):
         # Get data directory from config (should point to directory containing train/valid folders)
         data_dir = self.config["training"]["data_dir"]
+        depth_cfg = self.config.get("model", {}).get("depth_guidance", {})
 
         # Load datasets using COCO format
         print_rank0(f"\nLoading training data from {data_dir}...")
-        train_ds = COCOSegmentDataset(data_dir=data_dir, split="train")
+        train_ds = COCOSegmentDataset(
+            data_dir=data_dir,
+            split="train",
+            depth_cfg=depth_cfg,
+        )
 
         # Check if validation data exists
         has_validation = False
@@ -966,7 +1293,11 @@ class SAM3TrainerNative:
 
         try:
             print_rank0(f"\nLoading validation data from {data_dir}...")
-            val_ds = COCOSegmentDataset(data_dir=data_dir, split="valid")
+            val_ds = COCOSegmentDataset(
+                data_dir=data_dir,
+                split="valid",
+                depth_cfg=depth_cfg,
+            )
             if len(val_ds) > 0:
                 has_validation = True
                 print_rank0(f"Found validation data: {len(val_ds)} images")
@@ -1143,6 +1474,17 @@ class SAM3TrainerNative:
                         # Compute loss using Sam3LossWrapper
                         # This handles num_boxes calculation and proper weighting
                         loss_dict = self.loss_wrapper(outputs_list, find_targets)
+                        depth_loss_dict = self._compute_depth_aux_losses(
+                            outputs_list,
+                            find_targets,
+                            input_batch,
+                        )
+                        if depth_loss_dict:
+                            loss_dict[CORE_LOSS_KEY] = (
+                                loss_dict[CORE_LOSS_KEY]
+                                + depth_loss_dict.pop(CORE_LOSS_KEY)
+                            )
+                            loss_dict.update(depth_loss_dict)
 
                         # Extract total loss
                         total_loss = loss_dict[CORE_LOSS_KEY]
@@ -1217,6 +1559,17 @@ class SAM3TrainerNative:
 
                         # Compute loss using Sam3LossWrapper
                         loss_dict = self.loss_wrapper(outputs_list, find_targets)
+                        depth_loss_dict = self._compute_depth_aux_losses(
+                            outputs_list,
+                            find_targets,
+                            input_batch,
+                        )
+                        if depth_loss_dict:
+                            loss_dict[CORE_LOSS_KEY] = (
+                                loss_dict[CORE_LOSS_KEY]
+                                + depth_loss_dict.pop(CORE_LOSS_KEY)
+                            )
+                            loss_dict.update(depth_loss_dict)
                         total_loss = loss_dict[CORE_LOSS_KEY]
 
                         val_losses.append(total_loss.item())

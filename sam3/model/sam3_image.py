@@ -395,6 +395,7 @@ class Sam3Image(torch.nn.Module):
         prompt,
         prompt_mask,
         hs,
+        depth_batch=None,
     ):
         apply_dac = self.transformer.decoder.dac and self.training
         if self.segmentation_head is not None:
@@ -409,6 +410,7 @@ class Sam3Image(torch.nn.Module):
                 act_ckpt_enable=self.training and self.use_act_checkpoint_seg_head,
                 prompt=prompt,
                 prompt_mask=prompt_mask,
+                depth_batch=depth_batch,
             )
             aux_masks = False  # self.aux_loss and self.segmentation_head.aux_masks
             for k, v in seg_head_outputs.items():
@@ -486,6 +488,7 @@ class Sam3Image(torch.nn.Module):
                 prompt=prompt,
                 prompt_mask=prompt_mask,
                 hs=hs,
+                depth_batch=backbone_out.get("depth_batch", None),
             )
 
         if self.training or self.num_interactive_steps_val > 0:
@@ -529,7 +532,10 @@ class Sam3Image(torch.nn.Module):
 
     def forward(self, input: BatchedDatapoint):
         device = self.device
-        backbone_out = {"img_batch_all_stages": input.img_batch}
+        backbone_out = {
+            "img_batch_all_stages": input.img_batch,
+            "depth_batch": getattr(input, "depth_batch", None),
+        }
         backbone_out.update(self.backbone.forward_image(input.img_batch))
         num_frames = len(input.find_inputs)
         assert num_frames == 1

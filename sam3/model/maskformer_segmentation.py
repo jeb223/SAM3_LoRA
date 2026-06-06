@@ -146,6 +146,81 @@ class ConvGNAct(nn.Module):
         return self.block(x)
 
 
+class DepthEncoderLite(nn.Module):
+    """Lightweight encoder for D_norm, D_edge, and D_valid depth guidance."""
+
+    def __init__(
+        self,
+        input_channels: int = 3,
+        hidden_dim: int = 256,
+        base_dim: int = 64,
+        num_levels: int = 4,
+        interpolation_mode: str = "bilinear",
+    ):
+        super().__init__()
+        self.num_levels = num_levels
+        self.interpolation_mode = interpolation_mode
+
+        blocks = []
+        projs = []
+        in_ch = input_channels
+        for level in range(num_levels):
+            out_ch = min(base_dim * (2**level), hidden_dim)
+            blocks.append(
+                ConvGNAct(
+                    in_ch,
+                    out_ch,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                    act=True,
+                )
+            )
+            projs.append(
+                ConvGNAct(
+                    out_ch,
+                    hidden_dim,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                    act=True,
+                )
+            )
+            in_ch = out_ch
+
+        self.blocks = nn.ModuleList(blocks)
+        self.projs = nn.ModuleList(projs)
+
+    def _resize_to(self, x: torch.Tensor, size_hw):
+        if x.shape[-2:] == size_hw:
+            return x
+        if self.interpolation_mode in ("bilinear", "bicubic", "trilinear"):
+            return F.interpolate(
+                x,
+                size=size_hw,
+                mode=self.interpolation_mode,
+                align_corners=False,
+            )
+        return F.interpolate(x, size=size_hw, mode=self.interpolation_mode)
+
+    def forward(self, depth_batch: torch.Tensor, target_sizes: List[torch.Size]):
+        if depth_batch is None:
+            return None
+        if depth_batch.ndim == 3:
+            depth_batch = depth_batch.unsqueeze(0)
+
+        x = depth_batch.float()
+        encoded = []
+        for block in self.blocks:
+            x = block(x)
+            encoded.append(x)
+
+        depth_feats = []
+        for feat, proj, size_hw in zip(encoded, self.projs, target_sizes):
+            depth_feats.append(self._resize_to(proj(feat), size_hw))
+        return depth_feats
+
+
 class SRFLiteFusion(nn.Module):
     """Shallow-guided residual multi-scale fusion."""
 
@@ -156,11 +231,14 @@ class SRFLiteFusion(nn.Module):
         bottleneck_dim: Optional[int] = None,
         interpolation_mode: str = "bilinear",
         alpha_init: float = 0.0,
+        use_depth_guidance: bool = False,
+        depth_alpha_init: float = 0.1,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_levels = num_levels
         self.interpolation_mode = interpolation_mode
+        self.use_depth_guidance = bool(use_depth_guidance)
 
         if bottleneck_dim is None:
             bottleneck_dim = max(hidden_dim // 4, 32)
@@ -180,6 +258,32 @@ class SRFLiteFusion(nn.Module):
                 for _ in range(num_levels)
             ]
         )
+
+        if self.use_depth_guidance:
+            self.depth_align_layers = nn.ModuleList(
+                [
+                    ConvGNAct(
+                        hidden_dim,
+                        bottleneck_dim,
+                        kernel_size=1,
+                        stride=1,
+                        padding=0,
+                        act=True,
+                    )
+                    for _ in range(num_levels)
+                ]
+            )
+            self.depth_gate = nn.Sequential(
+                nn.Conv2d(bottleneck_dim * 2, bottleneck_dim, kernel_size=1),
+                nn.GELU(),
+                nn.Conv2d(bottleneck_dim, 1, kernel_size=1),
+                nn.Sigmoid(),
+            )
+            self.depth_alpha = nn.Parameter(torch.tensor(float(depth_alpha_init)))
+        else:
+            self.depth_align_layers = None
+            self.depth_gate = None
+            self.depth_alpha = None
 
         gate_mid = max(bottleneck_dim // 2, 8)
         self.attn_gate = nn.Sequential(
@@ -227,6 +331,24 @@ class SRFLiteFusion(nn.Module):
                 )
         return aligned
 
+    @staticmethod
+    def _match_batch_dim_to(
+        feats: List[torch.Tensor],
+        target_bs: int,
+    ) -> List[torch.Tensor]:
+        aligned = []
+        for feat in feats:
+            if feat.shape[0] == target_bs:
+                aligned.append(feat)
+            elif feat.shape[0] == 1:
+                aligned.append(feat.expand(target_bs, -1, -1, -1))
+            else:
+                raise RuntimeError(
+                    "SRFLiteFusion depth features cannot be broadcast to RGB batch: "
+                    f"target_bs={target_bs}, depth_shapes={[tuple(x.shape) for x in feats]}"
+                )
+        return aligned
+
     def _resize_to(self, x: torch.Tensor, size_hw):
         if x.shape[-2:] == size_hw:
             return x
@@ -239,7 +361,11 @@ class SRFLiteFusion(nn.Module):
             )
         return F.interpolate(x, size=size_hw, mode=self.interpolation_mode)
 
-    def forward(self, feats: List[torch.Tensor]) -> torch.Tensor:
+    def forward(
+        self,
+        feats: List[torch.Tensor],
+        depth_feats: Optional[List[torch.Tensor]] = None,
+    ) -> torch.Tensor:
         assert len(feats) == self.num_levels, (
             f"Expected {self.num_levels} feature levels, got {len(feats)}"
         )
@@ -252,6 +378,29 @@ class SRFLiteFusion(nn.Module):
             x = self._resize_to(x, target_hw)
             aligned.append(x)
 
+        if self.use_depth_guidance and depth_feats is not None:
+            assert len(depth_feats) == self.num_levels, (
+                f"Expected {self.num_levels} depth feature levels, got {len(depth_feats)}"
+            )
+            depth_feats = self._match_batch_dim(depth_feats)
+            depth_feats = self._match_batch_dim_to(
+                depth_feats,
+                target_bs=aligned[0].shape[0],
+            )
+            depth_aligned = []
+            for feat, proj in zip(depth_feats, self.depth_align_layers):
+                x = proj(feat.to(dtype=aligned[0].dtype))
+                x = self._resize_to(x, target_hw)
+                depth_aligned.append(x)
+
+            depth_gate = self.depth_gate(
+                torch.cat([aligned[0], depth_aligned[0]], dim=1)
+            )
+            aligned = [
+                rgb + self.depth_alpha * depth_gate * depth
+                for rgb, depth in zip(aligned, depth_aligned)
+            ]
+
         gate = self.attn_gate(aligned[0])
         gated_feats = [aligned[0]]
         for x in aligned[1:]:
@@ -262,12 +411,86 @@ class SRFLiteFusion(nn.Module):
         return self.alpha * fused
 
 
+class DepthContextFusionAdapter(nn.Module):
+    """Gate depth context into pixel features with a trainable residual scale."""
+
+    def __init__(self, hidden_dim: int, alpha_init: float = 0.0):
+        super().__init__()
+        self.depth_proj = ConvGNAct(
+            hidden_dim,
+            hidden_dim,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            act=True,
+        )
+        self.gate = nn.Sequential(
+            nn.Conv2d(hidden_dim * 2, hidden_dim, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+
+    @staticmethod
+    def _as_batched(x: torch.Tensor):
+        if x.ndim == 3:
+            return x.unsqueeze(0), True
+        return x, False
+
+    @staticmethod
+    def _match_batch_dim(depth_context: torch.Tensor, pixel_embed: torch.Tensor):
+        if depth_context.shape[0] == pixel_embed.shape[0]:
+            return depth_context
+        if depth_context.shape[0] == 1:
+            return depth_context.expand(pixel_embed.shape[0], -1, -1, -1)
+        raise RuntimeError(
+            "Depth context batch dimension does not match pixel features: "
+            f"{tuple(depth_context.shape)} vs {tuple(pixel_embed.shape)}"
+        )
+
+    def forward(
+        self,
+        pixel_embed: torch.Tensor,
+        depth_context: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if depth_context is None:
+            return pixel_embed
+
+        pixel_batched, squeezed = self._as_batched(pixel_embed)
+        depth_batched, _ = self._as_batched(depth_context)
+        depth_batched = self._match_batch_dim(depth_batched, pixel_batched)
+        if depth_batched.shape[-2:] != pixel_batched.shape[-2:]:
+            depth_batched = F.interpolate(
+                depth_batched,
+                size=pixel_batched.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        depth_feat = self.depth_proj(depth_batched.to(dtype=pixel_batched.dtype))
+        gate = self.gate(torch.cat([pixel_batched, depth_feat], dim=1))
+        fused = pixel_batched + self.alpha * gate * depth_feat
+        return fused.squeeze(0) if squeezed else fused
+
+
 class BoundaryRefinementAdapter(nn.Module):
     """Lightweight boundary stream that refines pixel features and predicts edges."""
 
-    def __init__(self, hidden_dim):
+    def __init__(
+        self,
+        hidden_dim,
+        use_depth_guidance: bool = False,
+        depth_alpha_init: float = 0.0,
+    ):
         super().__init__()
+        self.use_depth_guidance = bool(use_depth_guidance)
         self.residual_scale = nn.Parameter(torch.zeros(1))
+        self.depth_fusion = (
+            DepthContextFusionAdapter(hidden_dim, alpha_init=depth_alpha_init)
+            if self.use_depth_guidance
+            else None
+        )
         self.refine = nn.Sequential(
             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=1, padding=1),
             nn.GroupNorm(8, hidden_dim),
@@ -278,8 +501,13 @@ class BoundaryRefinementAdapter(nn.Module):
         )
         self.boundary_head = nn.Conv2d(hidden_dim, 1, kernel_size=1)
 
-    def forward(self, pixel_embed):
-        boundary_features = self.refine(pixel_embed)
+    def forward(self, pixel_embed, depth_context: Optional[torch.Tensor] = None):
+        refined_input = (
+            self.depth_fusion(pixel_embed, depth_context)
+            if self.depth_fusion is not None
+            else pixel_embed
+        )
+        boundary_features = self.refine(refined_input)
         enhanced_pixel_embed = pixel_embed + self.residual_scale * boundary_features
         boundary_logits = self.boundary_head(boundary_features)
         return enhanced_pixel_embed, boundary_logits
@@ -297,6 +525,8 @@ class SegmentationHead(nn.Module):
         act_ckpt=False,
         shared_conv=False,
         compile_mode_pixel_decoder=None,
+        use_depth_boundary=False,
+        depth_boundary_alpha_init=0.0,
     ):
         super().__init__()
         self.use_encoder_inputs = use_encoder_inputs
@@ -319,7 +549,11 @@ class SegmentationHead(nn.Module):
             self.mask_predictor = MaskPredictor(hidden_dim, mask_dim=hidden_dim)
 
         self.boundary_adapter = _mark_trainable_adapter(
-            BoundaryRefinementAdapter(self.pixel_decoder.out_dim)
+            BoundaryRefinementAdapter(
+                self.pixel_decoder.out_dim,
+                use_depth_guidance=use_depth_boundary,
+                depth_alpha_init=depth_boundary_alpha_init,
+            )
         )
 
         self.act_ckpt = act_ckpt
@@ -342,20 +576,28 @@ class SegmentationHead(nn.Module):
         backbone_feats: List[torch.Tensor],
         image_ids,
         encoder_hidden_states,
-    ) -> torch.Tensor:
+        depth_batch: Optional[torch.Tensor] = None,
+    ):
         feature_device = backbone_feats[0].device  # features could be on CPU
         model_device = self.device
         image_ids_ = image_ids.to(feature_device)
         if self.use_encoder_inputs:
+            depth_for_decoder = None
             if backbone_feats[0].shape[0] > 1:
                 # For bs > 1, we construct the per query backbone features
                 backbone_visual_feats = []
                 for feat in backbone_feats:
                     # Copy the img features per query (pixel decoder won't share img feats)
                     backbone_visual_feats.append(feat[image_ids_, ...].to(model_device))
+                if depth_batch is not None:
+                    depth_for_decoder = depth_batch[
+                        image_ids.to(depth_batch.device), ...
+                    ].to(model_device)
             else:
                 # Bs=1, we rely on broadcasting for query-based processing
                 backbone_visual_feats = [bb_feat.clone() for bb_feat in backbone_feats]
+                if depth_batch is not None:
+                    depth_for_decoder = depth_batch.to(model_device)
             # Extract visual embeddings
             encoder_hidden_states = encoder_hidden_states.permute(1, 2, 0)
             spatial_dim = math.prod(backbone_feats[-1].shape[-2:])
@@ -365,20 +607,36 @@ class SegmentationHead(nn.Module):
 
             backbone_visual_feats[-1] = encoder_visual_embed
             if self.act_ckpt:
-                pixel_embed = checkpoint.checkpoint(
-                    self.pixel_decoder, backbone_visual_feats, use_reentrant=False
+                pixel_embed, depth_context = checkpoint.checkpoint(
+                    self.pixel_decoder,
+                    backbone_visual_feats,
+                    depth_for_decoder,
+                    use_reentrant=False,
                 )
             else:
-                pixel_embed = self.pixel_decoder(backbone_visual_feats)
+                pixel_embed, depth_context = self.pixel_decoder(
+                    backbone_visual_feats,
+                    depth_batch=depth_for_decoder,
+                )
         else:
             backbone_feats = [x.to(model_device) for x in backbone_feats]
-            pixel_embed = self.pixel_decoder(backbone_feats)
+            depth_for_decoder = (
+                depth_batch.to(model_device) if depth_batch is not None else None
+            )
+            pixel_embed, depth_context = self.pixel_decoder(
+                backbone_feats,
+                depth_batch=depth_for_decoder,
+            )
             if pixel_embed.shape[0] == 1:
                 # For batch_size=1 training, we can avoid the indexing to save memory
                 pixel_embed = pixel_embed.squeeze(0)
+                if depth_context is not None:
+                    depth_context = depth_context.squeeze(0)
             else:
                 pixel_embed = pixel_embed[image_ids, ...]
-        return pixel_embed
+                if depth_context is not None:
+                    depth_context = depth_context[image_ids, ...]
+        return pixel_embed, depth_context
 
     def forward(
         self,
@@ -386,17 +644,22 @@ class SegmentationHead(nn.Module):
         obj_queries: torch.Tensor,
         image_ids,
         encoder_hidden_states: Optional[torch.Tensor] = None,
+        depth_batch: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
         if self.use_encoder_inputs:
             assert encoder_hidden_states is not None
 
-        pixel_embed = self._embed_pixels(
+        pixel_embed, depth_context = self._embed_pixels(
             backbone_feats=backbone_feats,
             image_ids=image_ids,
             encoder_hidden_states=encoder_hidden_states,
+            depth_batch=depth_batch,
         )
-        pixel_embed, pred_boundaries = self.boundary_adapter(pixel_embed)
+        pixel_embed, pred_boundaries = self.boundary_adapter(
+            pixel_embed,
+            depth_context=depth_context,
+        )
 
         if self.no_dec:
             mask_pred = self.mask_predictor(pixel_embed)
@@ -421,11 +684,16 @@ class PixelDecoder(nn.Module):
         srf_bottleneck_dim=None,
         srf_interpolation_mode="bilinear",
         srf_alpha_init=0.0,
+        use_depth_guidance=False,
+        depth_input_channels=3,
+        depth_encoder_dim=64,
+        depth_alpha_init=0.1,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_upsampling_stages = num_upsampling_stages
         self.interpolation_mode = interpolation_mode
+        self.use_depth_guidance = bool(use_depth_guidance)
         conv_layers = []
         norms = []
         num_convs = 1 if shared_conv else num_upsampling_stages
@@ -446,6 +714,18 @@ class PixelDecoder(nn.Module):
         self.use_srf_lite = bool(use_srf_lite)
         max_available_levels = num_upsampling_stages + 1
         self.srf_num_levels = min(int(srf_num_levels), max_available_levels)
+        if self.use_depth_guidance and self.use_srf_lite and self.srf_num_levels >= 2:
+            self.depth_encoder = _mark_trainable_adapter(
+                DepthEncoderLite(
+                    input_channels=depth_input_channels,
+                    hidden_dim=hidden_dim,
+                    base_dim=depth_encoder_dim,
+                    num_levels=self.srf_num_levels,
+                    interpolation_mode=srf_interpolation_mode,
+                )
+            )
+        else:
+            self.depth_encoder = None
         if self.use_srf_lite and self.srf_num_levels >= 2:
             self.srf_lite = _mark_trainable_adapter(
                 SRFLiteFusion(
@@ -454,6 +734,8 @@ class PixelDecoder(nn.Module):
                     bottleneck_dim=srf_bottleneck_dim,
                     interpolation_mode=srf_interpolation_mode,
                     alpha_init=srf_alpha_init,
+                    use_depth_guidance=self.use_depth_guidance,
+                    depth_alpha_init=depth_alpha_init,
                 )
             )
         else:
@@ -465,7 +747,11 @@ class PixelDecoder(nn.Module):
             # Needed to make checkpointing happy. But we don't know if the module is checkpointed, so we disable it by default.
             torch._dynamo.config.optimize_ddp = False
 
-    def forward(self, backbone_feats: List[torch.Tensor]):
+    def forward(
+        self,
+        backbone_feats: List[torch.Tensor],
+        depth_batch: Optional[torch.Tensor] = None,
+    ):
         # Assumes backbone features are already projected (C == hidden dim)
 
         prev_fpn = backbone_feats[-1]
@@ -484,12 +770,22 @@ class PixelDecoder(nn.Module):
             prev_fpn = F.relu(self.norms[layer_idx](prev_fpn))
             pyramid_feats.append(prev_fpn)
 
+        depth_context = None
         if self.srf_lite is not None and len(pyramid_feats) >= self.srf_num_levels:
             selected_feats = list(reversed(pyramid_feats[-self.srf_num_levels:]))
-            prev_fpn = prev_fpn + self.srf_lite(selected_feats)
+            depth_feats = None
+            if self.depth_encoder is not None and depth_batch is not None:
+                target_sizes = [feat.shape[-2:] for feat in selected_feats]
+                depth_feats = self.depth_encoder(depth_batch, target_sizes)
+                if depth_feats:
+                    depth_context = depth_feats[0]
+            prev_fpn = prev_fpn + self.srf_lite(
+                selected_feats,
+                depth_feats=depth_feats,
+            )
             prev_fpn = F.relu(prev_fpn)
 
-        return prev_fpn
+        return prev_fpn, depth_context
 
 
 class UniversalSegmentationHead(SegmentationHead):
@@ -506,6 +802,10 @@ class UniversalSegmentationHead(SegmentationHead):
         presence_head: bool = False,
         dot_product_scorer=None,
         cross_attend_prompt=None,
+        use_depth_boundary=False,
+        depth_boundary_alpha_init=0.0,
+        use_depth_semantic_fusion=False,
+        depth_semantic_alpha_init=0.0,
     ):
         super().__init__(
             hidden_dim=hidden_dim,
@@ -515,6 +815,8 @@ class UniversalSegmentationHead(SegmentationHead):
             no_dec=no_dec,
             pixel_decoder=pixel_decoder,
             act_ckpt=act_ckpt,
+            use_depth_boundary=use_depth_boundary,
+            depth_boundary_alpha_init=depth_boundary_alpha_init,
         )
         self.d_model = hidden_dim
 
@@ -534,6 +836,17 @@ class UniversalSegmentationHead(SegmentationHead):
             self.cross_attn_norm = nn.LayerNorm(self.d_model)
 
         self.semantic_seg_head = nn.Conv2d(self.pixel_decoder.out_dim, 1, kernel_size=1)
+        self.use_depth_semantic_fusion = bool(use_depth_semantic_fusion)
+        self.semantic_depth_fusion = (
+            _mark_trainable_adapter(
+                DepthContextFusionAdapter(
+                    self.pixel_decoder.out_dim,
+                    alpha_init=depth_semantic_alpha_init,
+                )
+            )
+            if self.use_depth_semantic_fusion
+            else None
+        )
         self.instance_seg_head = nn.Conv2d(
             self.pixel_decoder.out_dim, self.d_model, kernel_size=1
         )
@@ -546,6 +859,7 @@ class UniversalSegmentationHead(SegmentationHead):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         prompt: Optional[torch.Tensor] = None,
         prompt_mask: Optional[torch.Tensor] = None,
+        depth_batch: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Dict[str, Optional[torch.Tensor]]:
         assert encoder_hidden_states is not None
@@ -574,12 +888,16 @@ class UniversalSegmentationHead(SegmentationHead):
                 .squeeze(1)
             )
 
-        pixel_embed = self._embed_pixels(
+        pixel_embed, depth_context = self._embed_pixels(
             backbone_feats=backbone_feats,
             image_ids=image_ids,
             encoder_hidden_states=encoder_hidden_states,
+            depth_batch=depth_batch,
         )
-        pixel_embed, pred_boundaries = self.boundary_adapter(pixel_embed)
+        pixel_embed, pred_boundaries = self.boundary_adapter(
+            pixel_embed,
+            depth_context=depth_context,
+        )
 
         instance_embeds = self.instance_seg_head(pixel_embed)
 
@@ -590,9 +908,15 @@ class UniversalSegmentationHead(SegmentationHead):
         else:
             mask_pred = self.mask_predictor(obj_queries[-1], instance_embeds)
 
+        semantic_embed = (
+            self.semantic_depth_fusion(pixel_embed, depth_context)
+            if self.semantic_depth_fusion is not None
+            else pixel_embed
+        )
+
         return {
             "pred_masks": mask_pred,
             "pred_boundaries": pred_boundaries,
-            "semantic_seg": self.semantic_seg_head(pixel_embed),
+            "semantic_seg": self.semantic_seg_head(semantic_embed),
             "presence_logit": presence_logit,
         }

@@ -44,15 +44,25 @@ from sam3.perflib.nms import nms_masks
 
 class COCOSegmentDataset(Dataset):
     """Dataset class for COCO format segmentation data"""
-    def __init__(self, data_dir, split="train"):
+    def __init__(self, data_dir, split="train", depth_cfg=None):
         """
         Args:
             data_dir: Root directory containing train/valid/test folders
             split: One of 'train', 'valid', 'test'
+            depth_cfg: Optional DGS-SAM3 depth guidance configuration
         """
         self.data_dir = Path(data_dir)
         self.split = split
         self.split_dir = self.data_dir / split
+        self.depth_cfg = depth_cfg or {}
+        self.depth_enabled = bool(self.depth_cfg.get("enabled", False))
+        self.depth_dir = self.depth_cfg.get("depth_dir", "depth")
+        self.depth_extensions = self.depth_cfg.get(
+            "depth_extensions", [".png", ".jpg", ".jpeg", ".tif", ".tiff"]
+        )
+        self.depth_missing_policy = str(
+            self.depth_cfg.get("missing_policy", "zeros")
+        ).lower()
 
         # Load COCO annotations
         ann_file = self.split_dir / "_annotations.coco.json"
@@ -80,6 +90,11 @@ class COCOSegmentDataset(Dataset):
         print(f"  Images: {len(self.image_ids)}")
         print(f"  Annotations: {len(self.coco_data['annotations'])}")
         print(f"  Categories: {self.categories}")
+        if self.depth_enabled:
+            print(
+                "  Depth guidance: enabled "
+                f"(depth_dir={self.depth_dir}, missing_policy={self.depth_missing_policy})"
+            )
 
         self.resolution = 1008
         self.transform = v2.Compose([
@@ -90,6 +105,81 @@ class COCOSegmentDataset(Dataset):
 
     def __len__(self):
         return len(self.image_ids)
+
+    def _resolve_depth_path(self, img_info, img_path: Path):
+        if not self.depth_enabled:
+            return None
+
+        candidates = []
+        for key in ("depth_file_name", "depth_path", "depth", "depth_name"):
+            value = img_info.get(key, None)
+            if value:
+                value_path = Path(value)
+                if value_path.is_absolute():
+                    candidates.append(value_path)
+                else:
+                    candidates.append(self.split_dir / value_path)
+                    candidates.append(self.data_dir / value_path)
+
+        file_name_path = Path(img_info["file_name"])
+        stem_path = file_name_path.with_suffix("")
+        depth_dir = Path(self.depth_dir)
+        depth_roots = [depth_dir] if depth_dir.is_absolute() else [
+            self.split_dir / depth_dir,
+            self.data_dir / depth_dir / self.split,
+            self.data_dir / depth_dir,
+        ]
+        for root in depth_roots:
+            for ext in self.depth_extensions:
+                candidates.append(root / file_name_path.with_suffix(ext))
+                candidates.append(root / f"{stem_path.name}{ext}")
+                candidates.append(root / f"{stem_path.name}_depth{ext}")
+                candidates.append(img_path.with_name(f"{stem_path.name}_depth{ext}"))
+
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+
+        if self.depth_missing_policy == "error":
+            raise FileNotFoundError(
+                f"Depth map not found for image {img_info['file_name']}"
+            )
+        return None
+
+    def _load_depth_tensor(self, depth_path, size_hw):
+        if depth_path is None:
+            return torch.zeros((3, *size_hw), dtype=torch.float32)
+
+        depth_img = PILImage.open(depth_path)
+        depth_img = depth_img.resize((size_hw[1], size_hw[0]), PILImage.NEAREST)
+        depth_np = np.asarray(depth_img)
+        if depth_np.ndim == 3:
+            depth_np = depth_np.astype(np.float32).mean(axis=-1)
+        else:
+            depth_np = depth_np.astype(np.float32)
+
+        valid = np.isfinite(depth_np) & (depth_np > 0)
+        depth_norm = np.zeros_like(depth_np, dtype=np.float32)
+        if valid.any():
+            valid_depth = depth_np[valid]
+            low, high = np.percentile(valid_depth, [1, 99])
+            if high <= low:
+                low = float(valid_depth.min())
+                high = float(valid_depth.max())
+            denom = max(float(high - low), 1e-6)
+            depth_norm = np.clip((depth_np - low) / denom, 0.0, 1.0).astype(np.float32)
+            depth_norm[~valid] = 0.0
+
+        grad_y, grad_x = np.gradient(depth_norm)
+        depth_edge = np.sqrt(grad_x * grad_x + grad_y * grad_y).astype(np.float32)
+        edge_max = float(depth_edge.max())
+        if edge_max > 1e-6:
+            depth_edge = depth_edge / edge_max
+        depth_edge[~valid] = 0.0
+
+        depth_valid = valid.astype(np.float32)
+        depth_tensor = np.stack([depth_norm, depth_edge, depth_valid], axis=0)
+        return torch.from_numpy(depth_tensor).float()
 
     def __getitem__(self, idx):
         img_id = self.image_ids[idx]
@@ -105,6 +195,13 @@ class COCOSegmentDataset(Dataset):
 
         # Transform to tensor
         image_tensor = self.transform(pil_image)
+        depth_tensor = None
+        if self.depth_enabled:
+            depth_path = self._resolve_depth_path(img_info, img_path)
+            depth_tensor = self._load_depth_tensor(
+                depth_path,
+                (self.resolution, self.resolution),
+            )
 
         # Get annotations for this image
         annotations = self.img_to_anns.get(img_id, [])
@@ -187,7 +284,8 @@ class COCOSegmentDataset(Dataset):
         image_obj = Image(
             data=image_tensor,
             objects=objects,
-            size=(self.resolution, self.resolution)
+            size=(self.resolution, self.resolution),
+            depth=depth_tensor,
         )
 
         # Construct Queries - one per unique category
@@ -1165,6 +1263,8 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
 
     model_cfg = {} if config is None else config.get("model", {})
     srf_cfg = model_cfg.get("srf_lite", {})
+    depth_cfg = model_cfg.get("depth_guidance", {})
+    depth_enabled = bool(depth_cfg.get("enabled", False))
 
     # Build model
     print("\nBuilding SAM3 model...")
@@ -1179,6 +1279,14 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         srf_bottleneck_dim=srf_cfg.get("bottleneck_dim", None),
         srf_interpolation_mode=str(srf_cfg.get("interpolation_mode", "bilinear")),
         srf_alpha_init=float(srf_cfg.get("alpha_init", 0.0)),
+        use_depth_guidance=depth_enabled,
+        depth_input_channels=int(depth_cfg.get("input_channels", 3)),
+        depth_encoder_dim=int(depth_cfg.get("encoder_dim", 64)),
+        depth_alpha_init=float(depth_cfg.get("alpha_init", 0.1)),
+        use_depth_boundary=bool(depth_cfg.get("use_depth_boundary", True)),
+        depth_boundary_alpha_init=float(depth_cfg.get("boundary_alpha_init", 0.0)),
+        use_depth_semantic_fusion=bool(depth_cfg.get("use_semantic_fusion", True)),
+        depth_semantic_alpha_init=float(depth_cfg.get("semantic_alpha_init", 0.0)),
     )
 
     if use_base_model:
@@ -1223,9 +1331,19 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
 
     # Create a simple dataset class that loads from the directory directly
     class DirectCOCODataset(COCOSegmentDataset):
-        def __init__(self, data_dir):
+        def __init__(self, data_dir, depth_cfg=None):
             self.data_dir = Path(data_dir)
+            self.split = self.data_dir.name
             self.split_dir = self.data_dir
+            self.depth_cfg = depth_cfg or {}
+            self.depth_enabled = bool(self.depth_cfg.get("enabled", False))
+            self.depth_dir = self.depth_cfg.get("depth_dir", "depth")
+            self.depth_extensions = self.depth_cfg.get(
+                "depth_extensions", [".png", ".jpg", ".jpeg", ".tif", ".tiff"]
+            )
+            self.depth_missing_policy = str(
+                self.depth_cfg.get("missing_policy", "zeros")
+            ).lower()
 
             # Load COCO annotations
             ann_file = self.split_dir / "_annotations.coco.json"
@@ -1253,6 +1371,11 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
             print(f"  Images: {len(self.image_ids)}")
             print(f"  Annotations: {len(self.coco_data['annotations'])}")
             print(f"  Categories: {self.categories}")
+            if self.depth_enabled:
+                print(
+                    "  Depth guidance: enabled "
+                    f"(depth_dir={self.depth_dir}, missing_policy={self.depth_missing_policy})"
+                )
 
             self.resolution = 1008
             self.transform = v2.Compose([
@@ -1261,7 +1384,7 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
                 v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ])
 
-    val_ds = DirectCOCODataset(val_data_dir)
+    val_ds = DirectCOCODataset(val_data_dir, depth_cfg=depth_cfg)
 
     if num_samples:
         print(f"\n[INFO] Limiting validation to {num_samples} samples for debugging")
