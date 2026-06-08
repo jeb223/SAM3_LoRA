@@ -28,7 +28,13 @@ from sam3.train.matcher import BinaryHungarianMatcherV2, BinaryOneToManyMatcher
 from sam3.train.data.collator import collate_fn_api
 from sam3.train.data.sam3_image_dataset import Datapoint, Image, Object, FindQueryLoaded, InferenceMetadata
 from sam3.model.box_ops import box_xywh_to_xyxy
+from sam3.model.tref_matching import (
+    TextCandidateMatchingHead,
+    extract_text_attribute_features,
+    text_attribute_feature_dim,
+)
 from lora_layers import LoRAConfig, apply_lora_to_model, load_lora_weights, count_parameters
+from tref_sam3_dataset import ReferringSegmentDataset
 
 from torchvision.transforms import v2
 
@@ -1111,6 +1117,42 @@ def move_to_device(obj, device):
     return obj
 
 
+def attach_tref_matching_scores(model, outputs_list, input_batch, tref_cfg):
+    if not bool(tref_cfg.get("enabled", False)):
+        return
+    head = getattr(model, "tref_matching_head", None)
+    if head is None:
+        return
+
+    replace_logits = bool(tref_cfg.get("replace_pred_logits", True))
+    score_weight = float(tref_cfg.get("score_weight", 1.0))
+    hash_dim = int(tref_cfg.get("text_hash_dim", 32))
+    with SAM3Output.iteration_mode(
+        outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
+    ) as outputs_iter:
+        for stage_id, stage_outputs in enumerate(outputs_iter):
+            find_input = input_batch.find_inputs[stage_id]
+            text_ids = find_input.text_ids.detach().cpu().view(-1).tolist()
+            texts = [input_batch.find_text_batch[int(text_id)] for text_id in text_ids]
+            for outputs in stage_outputs:
+                if "queries" not in outputs:
+                    continue
+                text_features = extract_text_attribute_features(
+                    texts,
+                    device=outputs["queries"].device,
+                    dtype=outputs["queries"].dtype,
+                    hash_dim=hash_dim,
+                )
+                ref_logits = head(outputs, text_features)
+                outputs["ref_match_logits"] = ref_logits
+                if replace_logits:
+                    outputs["pred_logits_base"] = outputs["pred_logits"]
+                    outputs["pred_logits"] = (
+                        outputs["pred_logits"]
+                        + score_weight * ref_logits.to(outputs["pred_logits"].dtype)
+                    )
+
+
 def validate(config_path, weights_path, val_data_dir, num_samples=None,
              prob_threshold=0.3, nms_iou=0.7, merge_cracks=False, merge_iou=0.15,
              use_base_model=False):
@@ -1144,6 +1186,8 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
     print(f"Using device: {device}")
 
     config = None
+    tref_cfg = {}
+    dataset_mode = "coco"
 
     # Load config for batch_size and other settings
     if use_base_model:
@@ -1162,6 +1206,8 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
 
         # Get batch_size from config
         batch_size = config["training"]["batch_size"]
+        tref_cfg = config.get("tref_matching", config["training"].get("tref_matching", {}))
+        dataset_mode = str(config["training"].get("dataset_mode", "coco")).lower()
 
     model_cfg = {} if config is None else config.get("model", {})
     srf_cfg = model_cfg.get("srf_lite", {})
@@ -1202,6 +1248,20 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         )
         model = apply_lora_to_model(model, lora_config)
 
+        if bool(tref_cfg.get("enabled", False)):
+            query_dim = int(getattr(model, "hidden_dim", 256))
+            text_dim = text_attribute_feature_dim(int(tref_cfg.get("text_hash_dim", 32)))
+            model.tref_matching_head = TextCandidateMatchingHead(
+                query_dim=query_dim,
+                text_feature_dim=text_dim,
+                hidden_dim=int(tref_cfg.get("hidden_dim", 256)),
+                dropout=float(tref_cfg.get("dropout", 0.1)),
+            )
+            print(
+                "TRef candidate matching head attached for validation: "
+                f"query_dim={query_dim}, text_dim={text_dim}"
+            )
+
         # Load weights
         print(f"\nLoading LoRA weights from {weights_path}...")
         load_lora_weights(model, weights_path)
@@ -1214,12 +1274,6 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
 
     # Load validation data directly from the specified directory
     print(f"\nLoading validation data from {val_data_dir}...")
-
-    # Load COCO annotations directly
-    from pathlib import Path
-    ann_file = Path(val_data_dir) / "_annotations.coco.json"
-    if not ann_file.exists():
-        raise FileNotFoundError(f"COCO annotation file not found: {ann_file}")
 
     # Create a simple dataset class that loads from the directory directly
     class DirectCOCODataset(COCOSegmentDataset):
@@ -1261,7 +1315,23 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
                 v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ])
 
-    val_ds = DirectCOCODataset(val_data_dir)
+    if dataset_mode in {"referring", "tref", "refseg", "refcoco"}:
+        ref_cfg = config["training"].get("referring", {})
+        val_ds = ReferringSegmentDataset(
+            data_dir=val_data_dir,
+            split=ref_cfg.get("val_split", "valid"),
+            annotations_file=ref_cfg.get("annotations_file", "annotations.json"),
+            refs_file=ref_cfg.get("refs_file", "referring_annotations.json"),
+            max_queries_per_image=int(ref_cfg.get("max_queries_per_image", 0)),
+            include_multi_target=bool(ref_cfg.get("include_multi_target", True)),
+            fallback_to_category_queries=bool(
+                ref_cfg.get("fallback_to_category_queries", False)
+            ),
+            training=False,
+            resolution=int(ref_cfg.get("resolution", 1008)),
+        )
+    else:
+        val_ds = DirectCOCODataset(val_data_dir)
 
     if num_samples:
         print(f"\n[INFO] Limiting validation to {num_samples} samples for debugging")
@@ -1354,8 +1424,10 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
             if use_amp:
                 with torch.amp.autocast("cuda"):
                     outputs_list = model(input_batch)
+                    attach_tref_matching_scores(model, outputs_list, input_batch, tref_cfg)
             else:
                 outputs_list = model(input_batch)
+                attach_tref_matching_scores(model, outputs_list, input_batch, tref_cfg)
 
             # Extract predictions
             with SAM3Output.iteration_mode(
@@ -1730,7 +1802,10 @@ if __name__ == "__main__":
         "--val_data_dir",
         type=str,
         required=True,
-        help="Direct path to validation data directory containing _annotations.coco.json (e.g., /workspace/data2/valid)"
+        help=(
+            "Validation data directory. COCO mode expects _annotations.coco.json; "
+            "TRef mode expects annotations.json and referring_annotations.json."
+        )
     )
     parser.add_argument(
         "--use-base-model",

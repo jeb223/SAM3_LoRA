@@ -55,7 +55,14 @@ from sam3.train.matcher import BinaryHungarianMatcherV2, BinaryOneToManyMatcher
 from sam3.train.data.collator import collate_fn_api
 from sam3.train.data.sam3_image_dataset import Datapoint, Image, Object, FindQueryLoaded, InferenceMetadata
 from sam3.model.box_ops import box_xywh_to_xyxy
+from sam3.model.tref_matching import (
+    TRefSelectionLoss,
+    TextCandidateMatchingHead,
+    extract_text_attribute_features,
+    text_attribute_feature_dim,
+)
 from lora_layers import LoRAConfig, apply_lora_to_model, save_lora_weights, count_parameters
+from tref_sam3_dataset import ReferringSegmentDataset
 
 from torchvision.transforms import v2
 import pycocotools.mask as mask_utils  # Required for RLE mask decoding in COCO dataset
@@ -819,10 +826,42 @@ class SAM3TrainerNative:
         )
         self.model = apply_lora_to_model(self.model, lora_config)
 
+        train_cfg = self.config["training"]
+        self.tref_cfg = self.config.get("tref_matching", train_cfg.get("tref_matching", {}))
+        self.tref_matching_enabled = bool(self.tref_cfg.get("enabled", False))
+        self.tref_replace_logits = bool(self.tref_cfg.get("replace_pred_logits", True))
+        self.tref_score_weight = float(self.tref_cfg.get("score_weight", 1.0))
+        self.tref_hash_dim = int(self.tref_cfg.get("text_hash_dim", 32))
+        self.tref_loss_fn = None
+        if self.tref_matching_enabled:
+            query_dim = int(getattr(self.model, "hidden_dim", 256))
+            text_dim = text_attribute_feature_dim(self.tref_hash_dim)
+            self.model.tref_matching_head = TextCandidateMatchingHead(
+                query_dim=query_dim,
+                text_feature_dim=text_dim,
+                hidden_dim=int(self.tref_cfg.get("hidden_dim", 256)),
+                dropout=float(self.tref_cfg.get("dropout", 0.1)),
+            )
+            self.tref_loss_fn = TRefSelectionLoss(
+                bce_weight=float(self.tref_cfg.get("bce_weight", 1.0)),
+                rank_weight=float(self.tref_cfg.get("rank_weight", 0.5)),
+                margin=float(self.tref_cfg.get("margin", 0.3)),
+                hard_negatives=int(self.tref_cfg.get("hard_negatives", 16)),
+                focal_gamma=float(self.tref_cfg.get("focal_gamma", 2.0)),
+            )
+            print_rank0(
+                "TRef candidate matching: "
+                f"enabled=True, query_dim={query_dim}, text_dim={text_dim}, "
+                f"replace_pred_logits={self.tref_replace_logits}, "
+                f"score_weight={self.tref_score_weight}"
+            )
+
         stats = count_parameters(self.model)
         print_rank0(f"Trainable params: {stats['trainable_parameters']:,} ({stats['trainable_percentage']:.2f}%)")
 
         self.model.to(self.device)
+        if self.tref_loss_fn is not None:
+            self.tref_loss_fn.to(self.device)
 
         # Wrap model with DDP if multi-GPU
         if self.multi_gpu:
@@ -846,7 +885,6 @@ class SAM3TrainerNative:
         )
 
         # Mixed precision + gradient accumulation settings
-        train_cfg = self.config["training"]
         self.grad_accum_steps = int(train_cfg.get("gradient_accumulation_steps", 1))
         if self.grad_accum_steps < 1:
             self.grad_accum_steps = 1
@@ -951,22 +989,102 @@ class SAM3TrainerNative:
             normalization="local",  # Use local normalization (no distributed training)
             normalize_by_valid_object_num=False,
         )
+
+    def _build_dataset(self, data_dir, split, training):
+        train_cfg = self.config["training"]
+        dataset_mode = str(train_cfg.get("dataset_mode", "coco")).lower()
+        if dataset_mode in {"referring", "tref", "refseg", "refcoco"}:
+            ref_cfg = train_cfg.get("referring", {})
+            return ReferringSegmentDataset(
+                data_dir=data_dir,
+                split=split,
+                annotations_file=ref_cfg.get("annotations_file", "annotations.json"),
+                refs_file=ref_cfg.get("refs_file", "referring_annotations.json"),
+                max_queries_per_image=int(ref_cfg.get("max_queries_per_image", 16)),
+                include_multi_target=bool(ref_cfg.get("include_multi_target", True)),
+                fallback_to_category_queries=bool(
+                    ref_cfg.get("fallback_to_category_queries", False)
+                ),
+                training=training,
+                resolution=int(ref_cfg.get("resolution", 1008)),
+            )
+        return COCOSegmentDataset(data_dir=data_dir, split=split)
+
+    def _texts_for_stage(self, input_batch, stage_id):
+        find_input = input_batch.find_inputs[stage_id]
+        text_ids = find_input.text_ids.detach().cpu().tolist()
+        return [input_batch.find_text_batch[int(text_id)] for text_id in text_ids]
+
+    def _attach_tref_matching_scores(self, outputs_list, input_batch):
+        if not self.tref_matching_enabled:
+            return
+        head = getattr(self._unwrapped_model, "tref_matching_head", None)
+        if head is None:
+            raise RuntimeError("TRef matching is enabled, but tref_matching_head is missing.")
+
+        with SAM3Output.iteration_mode(
+            outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
+        ) as outputs_iter:
+            for stage_id, stage_outputs in enumerate(outputs_iter):
+                texts = self._texts_for_stage(input_batch, stage_id)
+                for outputs in stage_outputs:
+                    if "queries" not in outputs:
+                        continue
+                    text_features = extract_text_attribute_features(
+                        texts,
+                        device=outputs["queries"].device,
+                        dtype=outputs["queries"].dtype,
+                        hash_dim=self.tref_hash_dim,
+                    )
+                    ref_logits = head(outputs, text_features)
+                    outputs["ref_match_logits"] = ref_logits
+                    if self.tref_replace_logits:
+                        outputs["pred_logits_base"] = outputs["pred_logits"]
+                        outputs["pred_logits"] = (
+                            outputs["pred_logits"]
+                            + self.tref_score_weight * ref_logits.to(outputs["pred_logits"].dtype)
+                        )
+
+    def _compute_tref_matching_losses(self, outputs_list, find_targets):
+        if not self.tref_matching_enabled or self.tref_loss_fn is None:
+            return {}
+
+        total_losses = {}
+        with SAM3Output.iteration_mode(
+            outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
+        ) as outputs_iter:
+            for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
+                for outputs in stage_outputs:
+                    if "ref_match_logits" not in outputs:
+                        continue
+                    loss_dict = self.tref_loss_fn(outputs, stage_targets)
+                    for key, value in loss_dict.items():
+                        total_losses[key] = total_losses.get(key, 0.0) + value
+        return total_losses
         
     def train(self):
         # Get data directory from config (should point to directory containing train/valid folders)
         data_dir = self.config["training"]["data_dir"]
+        train_cfg = self.config["training"]
+        ref_cfg = train_cfg.get("referring", {})
+        dataset_mode = str(train_cfg.get("dataset_mode", "coco")).lower()
+        is_referring_dataset = dataset_mode in {"referring", "tref", "refseg", "refcoco"}
+        train_split = ref_cfg.get("train_split", "train") if is_referring_dataset else "train"
+        val_split = ref_cfg.get("val_split", "valid") if is_referring_dataset else "valid"
+        train_data_dir = ref_cfg.get("train_data_dir", data_dir) if is_referring_dataset else data_dir
+        val_data_dir = ref_cfg.get("val_data_dir", data_dir) if is_referring_dataset else data_dir
 
         # Load datasets using COCO format
-        print_rank0(f"\nLoading training data from {data_dir}...")
-        train_ds = COCOSegmentDataset(data_dir=data_dir, split="train")
+        print_rank0(f"\nLoading training data from {train_data_dir}...")
+        train_ds = self._build_dataset(data_dir=train_data_dir, split=train_split, training=True)
 
         # Check if validation data exists
         has_validation = False
         val_ds = None
 
         try:
-            print_rank0(f"\nLoading validation data from {data_dir}...")
-            val_ds = COCOSegmentDataset(data_dir=data_dir, split="valid")
+            print_rank0(f"\nLoading validation data from {val_data_dir}...")
+            val_ds = self._build_dataset(data_dir=val_data_dir, split=val_split, training=False)
             if len(val_ds) > 0:
                 has_validation = True
                 print_rank0(f"Found validation data: {len(val_ds)} images")
@@ -1112,6 +1230,7 @@ class SAM3TrainerNative:
                         # Forward pass
                         # outputs_list is SAM3Output, we need to pass the whole thing to loss_wrapper
                         outputs_list = self.model(input_batch)
+                        self._attach_tref_matching_scores(outputs_list, input_batch)
 
                         # Prepare targets for loss
                         # input_batch.find_targets is a list of BatchedFindTarget (one per stage)
@@ -1143,6 +1262,12 @@ class SAM3TrainerNative:
                         # Compute loss using Sam3LossWrapper
                         # This handles num_boxes calculation and proper weighting
                         loss_dict = self.loss_wrapper(outputs_list, find_targets)
+                        tref_loss_dict = self._compute_tref_matching_losses(outputs_list, find_targets)
+                        if tref_loss_dict:
+                            loss_dict[CORE_LOSS_KEY] = (
+                                loss_dict[CORE_LOSS_KEY] + tref_loss_dict.pop(CORE_LOSS_KEY)
+                            )
+                            loss_dict.update(tref_loss_dict)
 
                         # Extract total loss
                         total_loss = loss_dict[CORE_LOSS_KEY]
@@ -1193,6 +1318,7 @@ class SAM3TrainerNative:
                         # Forward pass
                         with amp_autocast_context():
                             outputs_list = self.model(input_batch)
+                            self._attach_tref_matching_scores(outputs_list, input_batch)
 
                         # Prepare targets
                         find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
@@ -1217,6 +1343,12 @@ class SAM3TrainerNative:
 
                         # Compute loss using Sam3LossWrapper
                         loss_dict = self.loss_wrapper(outputs_list, find_targets)
+                        tref_loss_dict = self._compute_tref_matching_losses(outputs_list, find_targets)
+                        if tref_loss_dict:
+                            loss_dict[CORE_LOSS_KEY] = (
+                                loss_dict[CORE_LOSS_KEY] + tref_loss_dict.pop(CORE_LOSS_KEY)
+                            )
+                            loss_dict.update(tref_loss_dict)
                         total_loss = loss_dict[CORE_LOSS_KEY]
 
                         val_losses.append(total_loss.item())

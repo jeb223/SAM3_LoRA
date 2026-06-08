@@ -1,0 +1,110 @@
+# TRef-SAM3: text referring-expression segmentation training config.
+# This keeps the first innovation (LoRA + SRF-Lite + semantic auxiliary branch)
+# and adds a candidate-aware text matching head for expression-to-target masks.
+
+model:
+  name: "facebook/sam3"
+  cache_dir: null
+  srf_lite:
+    enabled: true
+    num_levels: 4
+    bottleneck_dim: 64
+    interpolation_mode: "bilinear"
+    alpha_init: 0.1
+
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "out_proj"
+    - "qkv"
+    - "proj"
+  apply_to_vision_encoder: true
+  apply_to_text_encoder: true
+  apply_to_geometry_encoder: false
+  apply_to_detr_encoder: true
+  apply_to_detr_decoder: true
+  apply_to_mask_decoder: true
+
+training:
+  # Point this to a directory containing annotations.json and referring_annotations.json.
+  # If train_data_dir/val_data_dir are set below, data_dir is only a fallback.
+  data_dir: "data/train_tref_strict"
+  dataset_mode: "referring"
+
+  referring:
+    annotations_file: "annotations.json"
+    refs_file: "referring_annotations.json"
+    train_data_dir: "data/train_tref_strict"
+    val_data_dir: "data/valid_tref_strict"
+    train_split: "train"
+    val_split: "valid"
+    max_queries_per_image: 16
+    include_multi_target: true
+    fallback_to_category_queries: false
+    resolution: 1008
+
+  batch_size: 2
+  num_workers: 2
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1e-8
+  max_grad_norm: 1.0
+  num_epochs: 100
+  warmup_steps: 200
+  lr_scheduler: "cosine"
+  logging_steps: 10
+  eval_steps: 100
+  save_steps: 100
+  save_total_limit: 5
+  mixed_precision: "bf16"
+  seed: 42
+  gradient_accumulation_steps: 8
+
+  semantic_optimization:
+    enabled: true
+    loss_weight: 20.0
+    dice_weight: 30.0
+    presence_weight: 1.0
+    focal: true
+    focal_alpha: 0.6
+    focal_gamma: 2.0
+    downsample: false
+    presence_head: true
+    presence_loss: false
+
+tref_matching:
+  enabled: true
+  hidden_dim: 256
+  dropout: 0.1
+  text_hash_dim: 32
+  replace_pred_logits: true
+  score_weight: 1.0
+  bce_weight: 1.0
+  rank_weight: 0.5
+  margin: 0.3
+  hard_negatives: 16
+  focal_gamma: 2.0
+
+output:
+  output_dir: "outputs/tref_sam3"
+  logging_dir: "logs"
+  save_lora_only: true
+  push_to_hub: false
+  hub_model_id: null
+
+evaluation:
+  metric: "iou"
+  save_predictions: false
+  compute_metrics_during_training: true
+
+hardware:
+  device: "cuda"
+  dataloader_pin_memory: true
+  use_compile: false
