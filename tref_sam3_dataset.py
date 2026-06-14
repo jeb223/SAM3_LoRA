@@ -245,13 +245,22 @@ class ReferringSegmentDataset(Dataset):
             return None
         try:
             if isinstance(segmentation, dict):
-                mask_np = mask_utils.decode(segmentation)
+                counts = segmentation.get("counts")
+                if isinstance(counts, list):
+                    # COCO may store uncompressed RLE with counts as a list.
+                    # pycocotools.decode expects compressed RLE, so convert first.
+                    rle = mask_utils.frPyObjects(segmentation, orig_h, orig_w)
+                    mask_np = mask_utils.decode(rle)
+                else:
+                    mask_np = mask_utils.decode(segmentation)
             elif isinstance(segmentation, list):
                 rles = mask_utils.frPyObjects(segmentation, orig_h, orig_w)
                 rle = mask_utils.merge(rles)
                 mask_np = mask_utils.decode(rle)
             else:
                 return None
+            if mask_np.ndim == 3:
+                mask_np = mask_np.any(axis=2)
             return torch.from_numpy(mask_np).bool()
         except Exception as exc:
             print(f"Warning: failed to decode segmentation for ann {ann.get('id')}: {exc}")

@@ -27,7 +27,7 @@ import yaml
 import json
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, RandomSampler
 from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
 from tqdm import tqdm
@@ -1104,8 +1104,21 @@ class SAM3TrainerNative:
         # Create samplers for distributed training
         train_sampler = None
         val_sampler = None
+        max_train_samples_per_epoch = int(
+            self.config["training"].get("max_train_samples_per_epoch", 0) or 0
+        )
+        use_limited_train_epoch = (
+            max_train_samples_per_epoch > 0
+            and max_train_samples_per_epoch < len(train_ds)
+        )
 
         if self.multi_gpu:
+            if use_limited_train_epoch:
+                print_rank0(
+                    "max_train_samples_per_epoch is ignored for multi-GPU DDP; "
+                    "using the full training dataset."
+                )
+                use_limited_train_epoch = False
             train_sampler = DistributedSampler(
                 train_ds,
                 num_replicas=self.world_size,
@@ -1119,6 +1132,16 @@ class SAM3TrainerNative:
                     rank=get_rank(),
                     shuffle=False
                 )
+        elif use_limited_train_epoch:
+            train_sampler = RandomSampler(
+                train_ds,
+                replacement=False,
+                num_samples=max_train_samples_per_epoch,
+            )
+            print_rank0(
+                "Using limited random training epoch: "
+                f"{max_train_samples_per_epoch}/{len(train_ds)} images per epoch"
+            )
 
         train_loader = DataLoader(
             train_ds,
@@ -1159,9 +1182,22 @@ class SAM3TrainerNative:
         print_rank0(f"Starting training for {epochs} epochs...")
 
         if has_validation:
-            print_rank0(f"Training samples: {len(train_ds)}, Validation samples: {len(val_ds)}")
+            if use_limited_train_epoch:
+                print_rank0(
+                    f"Training samples: {len(train_ds)} "
+                    f"({max_train_samples_per_epoch} sampled per epoch), "
+                    f"Validation samples: {len(val_ds)}"
+                )
+            else:
+                print_rank0(f"Training samples: {len(train_ds)}, Validation samples: {len(val_ds)}")
         else:
-            print_rank0(f"Training samples: {len(train_ds)}")
+            if use_limited_train_epoch:
+                print_rank0(
+                    f"Training samples: {len(train_ds)} "
+                    f"({max_train_samples_per_epoch} sampled per epoch)"
+                )
+            else:
+                print_rank0(f"Training samples: {len(train_ds)}")
             print_rank0("⚠️  No validation data found - training without validation")
 
         if self.multi_gpu:
